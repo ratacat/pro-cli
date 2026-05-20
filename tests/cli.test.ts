@@ -250,7 +250,7 @@ describe("robot-mode CLI", () => {
       });
       expect(JSON.parse(deepResearch.stdout).data.job).toMatchObject({
         model: "research",
-        reasoning: "none",
+        reasoning: "standard",
         options: { temporary: false },
       });
     });
@@ -462,11 +462,36 @@ describe("robot-mode CLI", () => {
       expect(result.code).toBe(0);
       const payload = JSON.parse(result.stdout);
       expect(payload.data.job.model).toBe("research");
-      expect(payload.data.job.reasoning).toBe("none");
+      expect(payload.data.job.reasoning).toBe("standard");
       expect(payload.data.job.options.temporary).toBe(false);
       const requestBody = requestBodyFromExpression(expression);
       expect(requestBody.model).toBe("research");
-      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody.thinking_effort).toBe("standard");
+      expect(requestBody).not.toHaveProperty("history_and_training_disabled");
+    });
+  });
+
+  test("ask connects Deep Research with extended thinking", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => {
+        expression = script;
+      });
+
+      const result = await run(
+        ["ask", "hello", "--model", "deep-research", "--reasoning", "extended", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.data.job.model).toBe("research");
+      expect(payload.data.job.reasoning).toBe("extended");
+      expect(payload.data.job.options.temporary).toBe(false);
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("research");
+      expect(requestBody.thinking_effort).toBe("extended");
       expect(requestBody).not.toHaveProperty("history_and_training_disabled");
     });
   });
@@ -485,7 +510,7 @@ describe("robot-mode CLI", () => {
     });
   });
 
-  test("rejects explicit reasoning for no-thinking models", async () => {
+  test("rejects explicit reasoning for GPT-4.5", async () => {
     await withHome(async (home) => {
       const result = await run(
         ["ask", "hello", "--model", "gpt-4-5", "--reasoning", "extended", "--json"],

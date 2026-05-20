@@ -81,8 +81,9 @@ const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
     id: "research",
     label: "Deep Research",
     source: "static-unverified",
-    reasoningLevels: [],
-    reasoningType: "none",
+    reasoningLevels: ["standard", "extended"],
+    reasoningType: "pro",
+    configurableThinkingEffort: true,
   },
 ];
 
@@ -189,9 +190,20 @@ function parseLiveModels(payload: LiveModelPayload): ModelCapability[] {
           : {}),
         ...(enabledTools.length > 0 ? { enabledTools } : {}),
       };
-      return capability;
+      return applyModelCapabilityOverride(capability);
     })
     .filter((model): model is ModelCapability => model !== null && model.id !== "auto");
+}
+
+function applyModelCapabilityOverride(model: ModelCapability): ModelCapability {
+  const staticModel = STATIC_MODEL_BY_ID.get(canonicalModelId(model.id));
+  if (model.id !== "research" || !staticModel) return model;
+  return {
+    ...model,
+    reasoningLevels: [...staticModel.reasoningLevels],
+    reasoningType: staticModel.reasoningType,
+    configurableThinkingEffort: staticModel.configurableThinkingEffort,
+  };
 }
 
 function parseReasoningLevels(value: unknown, reasoningType: unknown): string[] {

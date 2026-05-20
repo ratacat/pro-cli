@@ -95,7 +95,7 @@ describe("ChatGPT transport", () => {
     });
   });
 
-  test("omits thinking_effort for Deep Research requests", async () => {
+  test("sends thinking_effort for Deep Research requests", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       let expression = "";
       const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
@@ -103,7 +103,7 @@ describe("ChatGPT transport", () => {
         return { ok: true, status: 200, body: conversationStream("OK") } as T;
       });
 
-      const result = await runChatGptJob(job({ model: "deep-research", reasoning: "none" }), {
+      const result = await runChatGptJob(job({ model: "deep-research", reasoning: "extended" }), {
         sessionTokenPath,
         pageEvaluator,
       });
@@ -111,7 +111,7 @@ describe("ChatGPT transport", () => {
       expect(result).toBe("OK");
       const requestBody = requestBodyFromExpression(expression);
       expect(requestBody.model).toBe("research");
-      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody.thinking_effort).toBe("extended");
     });
   });
 

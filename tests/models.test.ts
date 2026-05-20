@@ -43,8 +43,9 @@ describe("model discovery", () => {
     expect(result.models.map((model) => model.id)).toContain("gpt-4-5");
     expect(result.models.find((model) => model.id === "research")).toMatchObject({
       label: "Deep Research",
-      reasoningLevels: [],
-      reasoningType: "none",
+      reasoningLevels: ["standard", "extended"],
+      reasoningType: "pro",
+      configurableThinkingEffort: true,
     });
   });
 
@@ -128,6 +129,35 @@ describe("model discovery", () => {
       const result = await listModels({ sessionTokenPath });
       expect(result.source).toBe("live");
       expect(result.models.map((model) => model.id)).toEqual(["gpt-5-5-pro"]);
+    });
+  });
+
+  test("overrides live Deep Research capability with observed web UI reasoning levels", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      globalThis.fetch = (async () =>
+        Response.json({
+          default_model_slug: "gpt-5-5",
+          models: [
+            {
+              slug: "research",
+              title: "Deep Research",
+              reasoning_type: "none",
+              thinking_efforts: [],
+              configurable_thinking_effort: false,
+            },
+          ],
+        })) as unknown as typeof fetch;
+
+      const result = await listModels({ sessionTokenPath });
+
+      expect(result.source).toBe("live");
+      expect(result.models[0]).toMatchObject({
+        id: "research",
+        label: "Deep Research",
+        reasoningLevels: ["standard", "extended"],
+        reasoningType: "pro",
+        configurableThinkingEffort: true,
+      });
     });
   });
 
