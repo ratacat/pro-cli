@@ -38,6 +38,72 @@ interface LiveModel {
   enabled_tools?: unknown;
 }
 
+const MODEL_ID_ALIASES = new Map<string, string>([
+  ["4.5", "gpt-4-5"],
+  ["gpt 4.5", "gpt-4-5"],
+  ["gpt-4.5", "gpt-4-5"],
+  ["deep research", "research"],
+  ["deep-research", "research"],
+  ["deep_research", "research"],
+]);
+
+const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
+  {
+    id: "gpt-5-5-pro",
+    label: "GPT-5.5 Pro",
+    source: "static-unverified",
+    reasoningLevels: ["standard", "extended"],
+    default: true,
+    reasoningType: "pro",
+  },
+  {
+    id: "gpt-5-4-pro",
+    label: "GPT-5.4 Pro",
+    source: "static-unverified",
+    reasoningLevels: ["standard", "extended"],
+    reasoningType: "pro",
+  },
+  {
+    id: "gpt-5-5-thinking",
+    label: "GPT-5.5 Thinking",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+  },
+  {
+    id: "gpt-4-5",
+    label: "GPT-4.5",
+    source: "static-unverified",
+    reasoningLevels: [],
+    reasoningType: "none",
+  },
+  {
+    id: "research",
+    label: "Deep Research",
+    source: "static-unverified",
+    reasoningLevels: [],
+    reasoningType: "none",
+  },
+];
+
+const STATIC_MODEL_BY_ID = new Map(STATIC_MODEL_CAPABILITIES.map((model) => [model.id, model]));
+
+export const NO_REASONING = "none";
+
+export function canonicalModelId(model: string): string {
+  const trimmed = model.trim();
+  return MODEL_ID_ALIASES.get(trimmed.toLowerCase()) ?? trimmed;
+}
+
+export function modelUsesThinkingEffort(model: string): boolean {
+  const capability = STATIC_MODEL_BY_ID.get(canonicalModelId(model));
+  return capability?.reasoningType !== "none";
+}
+
+export function modelRequiresSavedConversation(model: string): boolean {
+  return canonicalModelId(model) === "research";
+}
+
 export async function listModels(options: { sessionTokenPath: string }): Promise<ModelList> {
   const session = await loadSessionToken(options.sessionTokenPath).catch(() => null);
   if (!session) {
@@ -95,37 +161,11 @@ export function listStaticModels(warning?: string): ModelList {
   return {
     source: "static",
     defaultModel: DEFAULT_MODEL,
-    models: [
-      {
-        id: "gpt-5-5-pro",
-        label: "GPT-5.5 Pro",
-        source: "static-unverified",
-        reasoningLevels: ["standard", "extended"],
-        default: true,
-        reasoningType: "pro",
-      },
-      {
-        id: "gpt-5-4-pro",
-        label: "GPT-5.4 Pro",
-        source: "static-unverified",
-        reasoningLevels: ["standard", "extended"],
-        reasoningType: "pro",
-      },
-      {
-        id: "gpt-5-5-thinking",
-        label: "GPT-5.5 Thinking",
-        source: "static-unverified",
-        reasoningLevels: [...REASONING_LEVELS],
-        reasoningType: "reasoning",
-      },
-      {
-        id: "research",
-        label: "Deep Research",
-        source: "static-unverified",
-        reasoningLevels: [],
-        reasoningType: "none",
-      },
-    ],
+    models: STATIC_MODEL_CAPABILITIES.map((model) => ({
+      ...model,
+      reasoningLevels: [...model.reasoningLevels],
+      ...(model.enabledTools ? { enabledTools: [...model.enabledTools] } : {}),
+    })),
     warning: warning ?? "Live model discovery requires a captured ChatGPT session token.",
   };
 }

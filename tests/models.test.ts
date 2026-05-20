@@ -40,6 +40,12 @@ describe("model discovery", () => {
     expect(result.defaultModel).toBe("gpt-5-5-pro");
     expect(result.models.map((model) => model.id)).not.toContain("auto");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-5-pro");
+    expect(result.models.map((model) => model.id)).toContain("gpt-4-5");
+    expect(result.models.find((model) => model.id === "research")).toMatchObject({
+      label: "Deep Research",
+      reasoningLevels: [],
+      reasoningType: "none",
+    });
   });
 
   test("loads live ChatGPT model catalog with bearer auth", async () => {

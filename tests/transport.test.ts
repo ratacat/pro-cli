@@ -75,6 +75,46 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("omits thinking_effort for GPT-4.5 requests", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let expression = "";
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        expression = script;
+        return { ok: true, status: 200, body: conversationStream("OK") } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "gpt-4.5", reasoning: "none" }), {
+        sessionTokenPath,
+        pageEvaluator,
+      });
+
+      expect(result).toBe("OK");
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("gpt-4-5");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+    });
+  });
+
+  test("omits thinking_effort for Deep Research requests", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let expression = "";
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        expression = script;
+        return { ok: true, status: 200, body: conversationStream("OK") } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "deep-research", reasoning: "none" }), {
+        sessionTokenPath,
+        pageEvaluator,
+      });
+
+      expect(result).toBe("OK");
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("research");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+    });
+  });
+
   test("retries transient upstream failures", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       let attempts = 0;
@@ -546,14 +586,14 @@ describe("ChatGPT transport", () => {
   });
 });
 
-function job(): JobRecord {
+function job(patch: Partial<Pick<JobRecord, "model" | "reasoning">> = {}): JobRecord {
   const now = new Date().toISOString();
   return {
     id: "job_test",
     status: "running",
     prompt: "Reply with OK only.",
-    model: "gpt-5-5-pro",
-    reasoning: "standard",
+    model: patch.model ?? "gpt-5-5-pro",
+    reasoning: patch.reasoning ?? "standard",
     options: {
       instructions: "Use terse answers.",
       verbosity: "high",

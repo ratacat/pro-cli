@@ -20,7 +20,13 @@ import { EXIT, ProError, toProError } from "./errors";
 import { buildEphemeralJob, executeEphemeralJob } from "./executor";
 import { JobStore, redactJob } from "./jobs";
 import { fetchAccountSummary } from "./limits";
-import { listModels } from "./models";
+import {
+  canonicalModelId,
+  listModels,
+  modelRequiresSavedConversation,
+  modelUsesThinkingEffort,
+  NO_REASONING,
+} from "./models";
 import { runOdds, type AggregateMethod } from "./odds";
 import { loadSchema, runStructured } from "./structured";
 import type { CliIO } from "./output";
@@ -155,8 +161,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
       case "ask": {
         const prompt = await promptFromArgs([subcommand, ...rest].filter(Boolean), io.cwd);
         const askModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
-        const askReasoning = resolveReasoning(flagString(parsed.flags, "reasoning") ?? config.defaultReasoning ?? DEFAULT_REASONING);
+        const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
         const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
+        applyModelConversationRequirements(askOptions, parsed.flags, askModel);
         const schemaRaw = flagString(parsed.flags, "schema");
         const formatHint = flagString(parsed.flags, "format");
         if (schemaRaw && formatHint) {
@@ -227,11 +234,13 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           ODDS_REQUEST_FLAGS,
           "odds",
         );
+        const oddsModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
+        applyModelConversationRequirements(baseRequestOptions, parsed.flags, oddsModel);
         const result = await runOdds({
           question,
           context,
-          model: resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL),
-          reasoning: resolveReasoning(flagString(parsed.flags, "reasoning") ?? config.defaultReasoning ?? DEFAULT_REASONING),
+          model: oddsModel,
+          reasoning: resolveRequestReasoning(oddsModel, parsed.flags, config.defaultReasoning),
           samples,
           aggregate,
           allowFifty,
@@ -282,11 +291,14 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             ]);
           }
           const userPrompt = await promptFromArgs(rest, io.cwd);
+          const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
+          const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
+          applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
           const input = {
             prompt: userPrompt,
-            model: resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL),
-            reasoning: resolveReasoning(flagString(parsed.flags, "reasoning") ?? config.defaultReasoning ?? DEFAULT_REASONING),
-            options: await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create"),
+            model: jobModel,
+            reasoning: resolveRequestReasoning(jobModel, parsed.flags, config.defaultReasoning),
+            options: jobOptions,
           };
           if (!flagBoolean(parsed.flags, "no-start")) {
             const daemon = await ensureDaemonRunning(paths, io);
@@ -835,11 +847,44 @@ function resolveReasoning(reasoning: string): string {
   throw invalidArgs("Invalid --reasoning.", [`Allowed values: ${REASONING_LEVELS.join(", ")}.`]);
 }
 
+function resolveRequestReasoning(
+  model: string,
+  flags: Map<string, string | boolean | string[]>,
+  configuredReasoning?: string,
+): string {
+  const explicitReasoning = flagString(flags, "reasoning");
+  if (!modelUsesThinkingEffort(model)) {
+    if (explicitReasoning !== undefined) {
+      throw invalidArgs(`Model ${model} does not support --reasoning.`, [
+        `Omit --reasoning for ${model}; ChatGPT's model catalog exposes no thinking_effort levels for it.`,
+      ]);
+    }
+    return NO_REASONING;
+  }
+  return resolveReasoning(explicitReasoning ?? configuredReasoning ?? DEFAULT_REASONING);
+}
+
+function applyModelConversationRequirements(
+  options: Record<string, unknown>,
+  flags: Map<string, string | boolean | string[]>,
+  model: string,
+): void {
+  if (!modelRequiresSavedConversation(model)) return;
+  const store = readBooleanFlag(flags, "store");
+  const requestedTemporary = flagBoolean(flags, "temporary") || store === false;
+  if (requestedTemporary) {
+    throw invalidArgs("Deep Research does not support temporary chats.", [
+      "Remove --temporary or --store false; pro-cli uses a saved ChatGPT conversation for --model research.",
+    ]);
+  }
+  if (!options.conversationId) options.temporary = false;
+}
+
 function resolveModel(model: string): string {
-  const value = model.trim();
+  const value = canonicalModelId(model);
   if (!value || value === "auto") {
     throw invalidArgs("Invalid --model.", [
-      "Use a concrete model id such as gpt-5-5-pro, or run pro-cli models --json.",
+      "Use a concrete model id such as gpt-5-5-pro, gpt-4-5, or research; or run pro-cli models --json.",
     ]);
   }
   return value;

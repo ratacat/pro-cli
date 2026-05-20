@@ -230,6 +230,32 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test("creates durable GPT-4.5 and Deep Research jobs without reasoning effort", async () => {
+    await withHome(async (home) => {
+      const gpt45 = await run(["job", "create", "hello", "--no-start", "--model", "4.5", "--json"], {
+        tty: true,
+        home,
+      });
+      const deepResearch = await run(
+        ["job", "create", "hello", "--no-start", "--model", "Deep Research", "--json"],
+        { tty: true, home },
+      );
+
+      expect(gpt45.code).toBe(0);
+      expect(deepResearch.code).toBe(0);
+      expect(JSON.parse(gpt45.stdout).data.job).toMatchObject({
+        model: "gpt-4-5",
+        reasoning: "none",
+        options: { temporary: true },
+      });
+      expect(JSON.parse(deepResearch.stdout).data.job).toMatchObject({
+        model: "research",
+        reasoning: "none",
+        options: { temporary: false },
+      });
+    });
+  });
+
   test("ask reports missing session token without durable job storage", async () => {
     await withHome(async (home) => {
       const result = await run(["ask", "hello", "--json"], { tty: true, home });
@@ -394,6 +420,82 @@ describe("robot-mode CLI", () => {
       const requestBody = requestBodyFromExpression(expression);
       expect(requestBody.model).toBe("gpt-5-5-pro");
       expect(requestBody.thinking_effort).toBe("standard");
+    });
+  });
+
+  test("ask connects GPT-4.5 without a thinking effort", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => {
+        expression = script;
+      });
+
+      const result = await run(["ask", "hello", "--model", "gpt-4.5", "--json"], {
+        tty: true,
+        home,
+      });
+
+      expect(result.code).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.data.job.model).toBe("gpt-4-5");
+      expect(payload.data.job.reasoning).toBe("none");
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("gpt-4-5");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+    });
+  });
+
+  test("ask connects Deep Research without a thinking effort", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => {
+        expression = script;
+      });
+
+      const result = await run(["ask", "hello", "--model", "deep-research", "--json"], {
+        tty: true,
+        home,
+      });
+
+      expect(result.code).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.data.job.model).toBe("research");
+      expect(payload.data.job.reasoning).toBe("none");
+      expect(payload.data.job.options.temporary).toBe(false);
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("research");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody).not.toHaveProperty("history_and_training_disabled");
+    });
+  });
+
+  test("rejects temporary chats for Deep Research", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["ask", "hello", "--model", "deep-research", "--temporary", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(2);
+      const payload = JSON.parse(result.stderr);
+      expect(payload.error.code).toBe("INVALID_ARGS");
+      expect(payload.error.message).toContain("Deep Research does not support temporary chats");
+    });
+  });
+
+  test("rejects explicit reasoning for no-thinking models", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["ask", "hello", "--model", "gpt-4-5", "--reasoning", "extended", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(2);
+      const payload = JSON.parse(result.stderr);
+      expect(payload.error.code).toBe("INVALID_ARGS");
+      expect(payload.error.message).toContain("does not support --reasoning");
     });
   });
 

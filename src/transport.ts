@@ -4,6 +4,7 @@ import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, LimitsObservation } from "./jobs";
+import { canonicalModelId, modelUsesThinkingEffort } from "./models";
 import { isTokenFresh, loadSessionToken } from "./session-token";
 
 const CHATGPT_CONVERSATION_ENDPOINT = "https://chatgpt.com/backend-api/f/conversation";
@@ -863,8 +864,8 @@ interface PreparedChatRequirements {
 
 function buildRequestBody(job: JobRecord): Record<string, unknown> {
   const prompt = buildConversationPrompt(job);
-  const thinkingEffort = normalizeReasoning(job.reasoning);
   const model = normalizeModel(job.model);
+  const thinkingEffort = modelUsesThinkingEffort(model) ? normalizeReasoning(job.reasoning) : undefined;
   const conversationId = stringOption(job.options.conversationId);
   const parentMessageId = stringOption(job.options.parentMessageId) ?? "client-created-root";
   const temporary = booleanOption(job.options.temporary, !conversationId);
@@ -913,7 +914,7 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
     body.parallel_tools = parallelTools;
     body.force_parallel_switch = parallelTools ? "auto" : "none";
   }
-  body.thinking_effort = thinkingEffort;
+  if (thinkingEffort) body.thinking_effort = thinkingEffort;
 
   return body;
 }
@@ -1166,11 +1167,11 @@ function normalizeReasoning(reasoning: string): string {
 }
 
 function normalizeModel(model: string): string {
-  const value = model.trim() || DEFAULT_MODEL;
+  const value = canonicalModelId(model) || DEFAULT_MODEL;
   if (value === "auto") {
     throw new ProError("INVALID_MODEL", "The model auto is not supported.", {
       exitCode: EXIT.invalidArgs,
-      suggestions: ["Use a concrete model id such as gpt-5-5-pro."],
+      suggestions: ["Use a concrete model id such as gpt-5-5-pro, gpt-4-5, or research."],
     });
   }
   return value;
