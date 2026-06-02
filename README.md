@@ -1,7 +1,7 @@
 # pro-cli
 
 <p align="center">
-  <img src="assets/readme/pro-cli-hero.jpg" alt="Neon ChatGPT Pro interface globe for pro-cli" width="100%">
+  <img src="assets/readme/pro-cli-hero.png" alt="pro-cli terminal session with ChatGPT Pro response" width="100%">
 </p>
 
 Agent native CLI for querying ChatGPT Pro and Deep Research through your own logged-in web session, managed from your terminal.
