@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
-import { openSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -256,6 +256,7 @@ export async function runDaemonServer(
   await ensurePrivateDir(paths.home);
   const runtime = daemonRuntimePaths(paths.home);
   await ensurePrivateDir(runtime.dir);
+  touchPrivateFile(runtime.logPath);
   const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
   const startedAt = new Date().toISOString();
   const store = await JobStore.open(paths.dbPath);
@@ -303,7 +304,7 @@ export async function runDaemonServer(
     pumping = true;
     try {
       while (!stopping) {
-        const claimed = store.claimNextQueued();
+        const claimed = store.claimNextRunnable();
         if (!claimed) return;
         await executeClaimedJob(store, claimed, paths);
         lastActivityAt = Date.now();
@@ -378,6 +379,11 @@ async function startDaemonProcess(paths: RuntimePaths, io: CliIO): Promise<void>
     stdio: ["ignore", logFd, logFd],
   });
   child.unref();
+}
+
+function touchPrivateFile(path: string): void {
+  const fd = openSync(path, "a", 0o600);
+  closeSync(fd);
 }
 
 async function routeDaemonRequest(

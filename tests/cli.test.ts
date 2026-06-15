@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,7 +57,9 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("job create --wait: durable blocking query");
     expect(result.stdout).toContain("job wait: waits until done");
     expect(result.stdout).toContain("update: fast-forward install");
-    expect(result.stdout.length).toBeLessThan(260);
+    expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
+    expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
+    expect(result.stdout.length).toBeLessThan(520);
     expect(result.stderr).toBe("");
   });
 
@@ -69,7 +72,9 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("job create --wait: durable blocking query");
     expect(result.stdout).toContain("job wait: waits until done");
     expect(result.stdout).toContain("update: fast-forward install");
-    expect(result.stdout.length).toBeLessThan(260);
+    expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
+    expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
+    expect(result.stdout.length).toBeLessThan(520);
     expect(result.stderr).toBe("");
   });
 
@@ -251,7 +256,7 @@ describe("robot-mode CLI", () => {
       expect(JSON.parse(deepResearch.stdout).data.job).toMatchObject({
         model: "research",
         reasoning: "standard",
-        options: { temporary: false },
+        options: { temporary: false, timeoutMs: 1_800_000 },
       });
     });
   });
@@ -464,9 +469,18 @@ describe("robot-mode CLI", () => {
       expect(payload.data.job.model).toBe("research");
       expect(payload.data.job.reasoning).toBe("standard");
       expect(payload.data.job.options.temporary).toBe(false);
+      expect(payload.data.job.options.timeoutMs).toBe(1_800_000);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("research");
-      expect(requestBody.thinking_effort).toBe("standard");
+      expect(requestBody.model).toBe("gpt-5-5");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody.system_hints).toEqual(["connector:connector_openai_deep_research"]);
+      const messages = requestBody.messages as Array<{ metadata: Record<string, unknown> }>;
+      expect(messages[0].metadata).toMatchObject({
+        selected_sources: ["web"],
+        system_hints: ["connector:connector_openai_deep_research"],
+        deep_research_version: "standard",
+        venus_model_variant: "standard",
+      });
       expect(requestBody).not.toHaveProperty("history_and_training_disabled");
     });
   });
@@ -489,9 +503,18 @@ describe("robot-mode CLI", () => {
       expect(payload.data.job.model).toBe("research");
       expect(payload.data.job.reasoning).toBe("extended");
       expect(payload.data.job.options.temporary).toBe(false);
+      expect(payload.data.job.options.timeoutMs).toBe(1_800_000);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("research");
-      expect(requestBody.thinking_effort).toBe("extended");
+      expect(requestBody.model).toBe("gpt-5-5");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody.system_hints).toEqual(["connector:connector_openai_deep_research"]);
+      const messages = requestBody.messages as Array<{ metadata: Record<string, unknown> }>;
+      expect(messages[0].metadata).toMatchObject({
+        selected_sources: ["web"],
+        system_hints: ["connector:connector_openai_deep_research"],
+        deep_research_version: "standard",
+        venus_model_variant: "standard",
+      });
       expect(requestBody).not.toHaveProperty("history_and_training_disabled");
     });
   });
@@ -507,6 +530,51 @@ describe("robot-mode CLI", () => {
       const payload = JSON.parse(result.stderr);
       expect(payload.error.code).toBe("INVALID_ARGS");
       expect(payload.error.message).toContain("Deep Research does not support temporary chats");
+    });
+  });
+
+  test("image jobs default to saved conversations and a ten minute timeout", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["job", "create", "a blue paper boat", "--no-start", "--model", "image", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.data.job.model).toBe("image");
+      expect(payload.data.job.reasoning).toBe("standard");
+      expect(payload.data.job.options.temporary).toBe(false);
+      expect(payload.data.job.options.timeoutMs).toBe(600_000);
+    });
+  });
+
+  test("rejects temporary chats for image generation", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["ask", "a blue paper boat", "--model", "image", "--temporary", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(2);
+      const payload = JSON.parse(result.stderr);
+      expect(payload.error.code).toBe("INVALID_ARGS");
+      expect(payload.error.message).toContain("Image generation does not support temporary chats");
+    });
+  });
+
+  test("rejects Deep Research timeout values below thirty minutes", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["ask", "hello", "--model", "deep-research", "--timeout", "1000", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(2);
+      const payload = JSON.parse(result.stderr);
+      expect(payload.error.code).toBe("INVALID_ARGS");
+      expect(payload.error.message).toContain("Deep Research --timeout must be at least 1800000ms");
+      expect(payload.error.suggestions.join("\n")).toContain("--wait-timeout");
     });
   });
 
@@ -736,6 +804,162 @@ describe("robot-mode CLI", () => {
         expect(payload.data.wait.timedOut).toBe(true);
       } finally {
         await run(["daemon", "stop", "--json"], { tty: true, home });
+      }
+    });
+  });
+
+  test("job wait reconnects after DAEMON_UNAVAILABLE during a long wait", async () => {
+    await withHome(async (home) => {
+      const runtime = await writeDaemonEndpoint(home);
+      const store = await JobStore.open(join(home, "jobs.sqlite"));
+      let jobId = "";
+      try {
+        const created = store.create({
+          prompt: "hello",
+          model: "gpt-5-5-pro",
+          reasoning: "standard",
+          options: {},
+        });
+        jobId = created.id;
+        store.markRunning(jobId);
+      } finally {
+        store.close();
+      }
+
+      let healthCalls = 0;
+      let waitCalls = 0;
+      globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+        const url = new URL(String(input));
+        if (url.pathname === "/health") {
+          healthCalls += 1;
+          return Response.json({ ok: true, data: { state: "running", pid: process.pid, home } });
+        }
+        if (url.pathname === `/jobs/${jobId}/wait`) {
+          waitCalls += 1;
+          if (waitCalls === 1) throw new TypeError("socket closed");
+          return Response.json({
+            ok: true,
+            data: {
+              job: {
+                id: jobId,
+                status: "succeeded",
+                prompt: "",
+                model: "gpt-5-5-pro",
+                reasoning: "standard",
+                options: {},
+                result: null,
+                error: null,
+                createdAt: "2026-05-20T00:00:00.000Z",
+                updatedAt: "2026-05-20T00:00:01.000Z",
+                promptPreview: "hello",
+                resultPreview: "done",
+                hasResult: true,
+              },
+              wait: { status: "succeeded", timedOut: false, elapsedMs: 25, timeoutMs: 1000, pollMs: 25 },
+            },
+          });
+        }
+        return Response.json({ ok: false, error: { code: "UNEXPECTED", message: url.pathname, suggestions: [] } }, { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const result = await run(["job", "wait", jobId, "--wait-timeout", "1000", "--poll-ms", "25", "--json"], {
+          tty: true,
+          home,
+        });
+
+        expect(result.code).toBe(0);
+        const payload = JSON.parse(result.stdout);
+        expect(payload.ok).toBe(true);
+        expect(payload.data.job.status).toBe("succeeded");
+        expect(waitCalls).toBe(2);
+        expect(healthCalls).toBeGreaterThanOrEqual(2);
+      } finally {
+        await rm(runtime.dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("job create --wait reconnects after DAEMON_UNAVAILABLE without creating a second job", async () => {
+    await withHome(async (home) => {
+      const runtime = await writeDaemonEndpoint(home);
+      const jobId = "job_wait_reconnect";
+      let createCalls = 0;
+      let waitCalls = 0;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = new URL(String(input));
+        if (url.pathname === "/health") {
+          return Response.json({ ok: true, data: { state: "running", pid: process.pid, home } });
+        }
+        if (url.pathname === "/jobs" && init?.method === "POST") {
+          createCalls += 1;
+          return Response.json({
+            ok: true,
+            data: {
+              job: {
+                id: jobId,
+                status: "queued",
+                prompt: "",
+                model: "gpt-5-5-pro",
+                reasoning: "standard",
+                options: { temporary: true },
+                result: null,
+                error: null,
+                createdAt: "2026-05-20T00:00:00.000Z",
+                updatedAt: "2026-05-20T00:00:00.000Z",
+                promptPreview: "hello",
+                hasResult: false,
+              },
+              daemon: { accepted: true },
+            },
+          });
+        }
+        if (url.pathname === `/jobs/${jobId}/wait`) {
+          waitCalls += 1;
+          if (waitCalls === 1) throw new TypeError("connection reset");
+          return Response.json({
+            ok: true,
+            data: {
+              job: {
+                id: jobId,
+                status: "succeeded",
+                prompt: "",
+                model: "gpt-5-5-pro",
+                reasoning: "standard",
+                options: { temporary: true },
+                result: null,
+                error: null,
+                createdAt: "2026-05-20T00:00:00.000Z",
+                updatedAt: "2026-05-20T00:00:01.000Z",
+                promptPreview: "hello",
+                resultPreview: "done",
+                hasResult: true,
+              },
+              wait: { status: "succeeded", timedOut: false, elapsedMs: 25, timeoutMs: 1000, pollMs: 25 },
+            },
+          });
+        }
+        if (url.pathname === `/jobs/${jobId}/result`) {
+          return Response.json({ ok: true, data: { jobId, result: "done" } });
+        }
+        return Response.json({ ok: false, error: { code: "UNEXPECTED", message: url.pathname, suggestions: [] } }, { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const result = await run(["job", "create", "hello", "--wait", "--wait-timeout", "1000", "--poll-ms", "25", "--json"], {
+          tty: true,
+          home,
+        });
+
+        expect(result.code).toBe(0);
+        const payload = JSON.parse(result.stdout);
+        expect(payload.ok).toBe(true);
+        expect(payload.data.job.id).toBe(jobId);
+        expect(payload.data.result).toBe("done");
+        expect(createCalls).toBe(1);
+        expect(waitCalls).toBe(2);
+      } finally {
+        await rm(runtime.dir, { recursive: true, force: true });
       }
     });
   });
@@ -1213,6 +1437,42 @@ async function writeSessionToken(home: string): Promise<void> {
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     }),
   );
+}
+
+async function writeDaemonEndpoint(home: string): Promise<{ dir: string; endpointPath: string; logPath: string }> {
+  const runtime = daemonRuntimePathsForHome(home);
+  await mkdir(runtime.dir, { recursive: true, mode: 0o700 });
+  const now = new Date().toISOString();
+  await writeFile(
+    runtime.endpointPath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        pid: process.pid,
+        port: 49321,
+        token: "test-token",
+        home,
+        startedAt: now,
+        updatedAt: now,
+        logPath: runtime.logPath,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+  return runtime;
+}
+
+function daemonRuntimePathsForHome(home: string): { dir: string; endpointPath: string; logPath: string } {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const hash = createHash("sha256").update(home).digest("hex").slice(0, 12);
+  const dir = join("/tmp", `pro-cli-${uid}-${hash}`);
+  return {
+    dir,
+    endpointPath: join(dir, "daemon.json"),
+    logPath: join(dir, "daemon.log"),
+  };
 }
 
 function fakeJwt(): string {

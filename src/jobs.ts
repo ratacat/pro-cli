@@ -40,6 +40,21 @@ export interface LimitsSnapshot {
   jobId: string | null;
 }
 
+export interface ResearchTaskInput {
+  taskId: string;
+  title?: string;
+  conversationId?: string;
+}
+
+export interface ResearchTaskRecord extends ResearchTaskInput {
+  jobId: string;
+  status: string;
+  lastError: string | null;
+  nextPollAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface JobRow {
   id: string;
   status: JobStatus;
@@ -49,6 +64,18 @@ interface JobRow {
   options_json: string;
   result: string | null;
   error_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ResearchTaskRow {
+  job_id: string;
+  task_id: string;
+  title: string | null;
+  conversation_id: string | null;
+  status: string;
+  last_error_json: string | null;
+  next_poll_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -84,6 +111,23 @@ export class JobStore {
         job_id TEXT,
         PRIMARY KEY (feature_name, observed_at)
       )
+    `);
+    db.run(`
+      CREATE TABLE IF NOT EXISTS research_tasks (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        title TEXT,
+        conversation_id TEXT,
+        status TEXT NOT NULL,
+        last_error_json TEXT,
+        next_poll_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    db.run(`
+      CREATE INDEX IF NOT EXISTS research_tasks_next_poll_idx
+      ON research_tasks(next_poll_at)
     `);
     return new JobStore(db);
   }
@@ -179,6 +223,25 @@ export class JobStore {
     return row ? this.claimQueued(row.id) : null;
   }
 
+  claimNextRunnable(): JobRecord | null {
+    const queued = this.claimNextQueued();
+    if (queued) return queued;
+
+    const now = new Date().toISOString();
+    const resumable = this.db
+      .query(
+        `SELECT jobs.id
+         FROM jobs
+         INNER JOIN research_tasks ON research_tasks.job_id = jobs.id
+         WHERE jobs.status = ?
+           AND (research_tasks.next_poll_at IS NULL OR research_tasks.next_poll_at <= ?)
+         ORDER BY COALESCE(research_tasks.next_poll_at, jobs.updated_at) ASC, jobs.created_at ASC
+         LIMIT 1`,
+      )
+      .get("running", now) as { id: string } | null;
+    return resumable ? this.get(resumable.id) : null;
+  }
+
   markSucceeded(id: string, result: string): JobRecord {
     this.finishRunning(id, { status: "succeeded", result, error: null });
     return this.get(id);
@@ -235,6 +298,68 @@ export class JobStore {
       observedAt: row.observed_at,
       jobId: row.job_id,
     }));
+  }
+
+  upsertResearchTask(jobId: string, task: ResearchTaskInput): ResearchTaskRecord {
+    const now = new Date().toISOString();
+    this.db
+      .query(
+        `INSERT INTO research_tasks
+          (job_id, task_id, title, conversation_id, status, last_error_json, next_poll_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET
+          task_id = excluded.task_id,
+          title = excluded.title,
+          conversation_id = excluded.conversation_id,
+          status = excluded.status,
+          last_error_json = NULL,
+          next_poll_at = NULL,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        jobId,
+        task.taskId,
+        task.title ?? null,
+        task.conversationId ?? null,
+        "running",
+        null,
+        null,
+        now,
+        now,
+      );
+    return this.getResearchTask(jobId) as ResearchTaskRecord;
+  }
+
+  getResearchTask(jobId: string): ResearchTaskRecord | null {
+    const row = this.db
+      .query("SELECT * FROM research_tasks WHERE job_id = ?")
+      .get(jobId) as ResearchTaskRow | null;
+    return row ? rowToResearchTask(row) : null;
+  }
+
+  updateResearchTaskStatus(jobId: string, status: string): ResearchTaskRecord | null {
+    const now = new Date().toISOString();
+    this.db
+      .query(
+        `UPDATE research_tasks
+         SET status = ?, last_error_json = NULL, next_poll_at = NULL, updated_at = ?
+         WHERE job_id = ?`,
+      )
+      .run(status, now, jobId);
+    return this.getResearchTask(jobId);
+  }
+
+  deferResearchTask(jobId: string, error: ProError, delayMs: number): ResearchTaskRecord | null {
+    const now = new Date();
+    const nextPollAt = new Date(now.getTime() + delayMs).toISOString();
+    this.db
+      .query(
+        `UPDATE research_tasks
+         SET status = ?, last_error_json = ?, next_poll_at = ?, updated_at = ?
+         WHERE job_id = ?`,
+      )
+      .run("deferred", JSON.stringify(error.toPayload()), nextPollAt, now.toISOString(), jobId);
+    return this.getResearchTask(jobId);
   }
 
   close(): void {
@@ -299,6 +424,20 @@ function rowToJob(row: JobRow): JobRecord {
     options: JSON.parse(row.options_json) as Record<string, unknown>,
     result: row.result,
     error: row.error_json,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToResearchTask(row: ResearchTaskRow): ResearchTaskRecord {
+  return {
+    jobId: row.job_id,
+    taskId: row.task_id,
+    ...(row.title ? { title: row.title } : {}),
+    ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
+    status: row.status,
+    lastError: row.last_error_json,
+    nextPollAt: row.next_poll_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

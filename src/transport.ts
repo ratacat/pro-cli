@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
 import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
@@ -9,6 +11,16 @@ import { isTokenFresh, loadSessionToken } from "./session-token";
 
 const CHATGPT_CONVERSATION_ENDPOINT = "https://chatgpt.com/backend-api/f/conversation";
 const DEFAULT_CDP_BASE = "http://127.0.0.1:9222";
+const DEFAULT_RESEARCH_TASK_POLL_MS = 5_000;
+const DEFAULT_RESEARCH_WIDGET_POLL_MS = 30_000;
+const DEFAULT_RESEARCH_WIDGET_RATE_LIMIT_POLL_MS = 60_000;
+const DEFAULT_BROWSER_REQUEST_TIMEOUT_MS = 30 * 60_000;
+const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
+const DEEP_RESEARCH_CONNECTOR_ID = "connector_openai_deep_research";
+const DEEP_RESEARCH_ROUTER_MODEL = "gpt-5-5";
+const IMAGE_TASK_PREFIX = "image:";
+const DEFAULT_IMAGE_POLL_MS = 3_000;
+const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
 
 type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
 
@@ -19,30 +31,24 @@ export interface TransportOptions {
   timeoutMs?: number;
   retries?: number;
   retryDelayMs?: number;
+  artifactDir?: string;
   onLimits?: (observations: LimitsObservation[]) => void;
+  onResearchTask?: (task: ResearchTask) => void | Promise<void>;
+  onResearchTaskStatus?: (update: ResearchTaskStatusUpdate) => void | Promise<void>;
+}
+
+export interface ResearchTask {
+  taskId: string;
+  title?: string;
+  conversationId?: string;
+}
+
+export interface ResearchTaskStatusUpdate extends ResearchTask {
+  status: string;
 }
 
 export async function runChatGptJob(job: JobRecord, options: TransportOptions): Promise<string> {
-  const session = await loadSessionToken(options.sessionTokenPath).catch(() => null);
-  if (!session) {
-    throw new ProError("SESSION_TOKEN_MISSING", "No ChatGPT session token is available.", {
-      exitCode: EXIT.auth,
-      suggestions: ["Run pro-cli auth capture from a logged-in ChatGPT CDP browser."],
-    });
-  }
-  if (!isTokenFresh(session)) {
-    throw new ProError("SESSION_TOKEN_EXPIRED", "The ChatGPT session token is expired.", {
-      exitCode: EXIT.auth,
-      suggestions: ["Run pro-cli auth capture again from a logged-in ChatGPT browser."],
-    });
-  }
-  if (!session.accountId) {
-    throw new ProError("ACCOUNT_ID_MISSING", "The ChatGPT account id is missing from the token.", {
-      exitCode: EXIT.auth,
-      suggestions: ["Run pro-cli auth capture again and confirm ChatGPT is logged in."],
-    });
-  }
-
+  const session = await loadFreshSession(options.sessionTokenPath);
   const retries = integerOption(options.retries, 0, 0, 5) ?? 0;
   const retryDelayMs = integerOption(options.retryDelayMs, 500, 0, 60_000) ?? 500;
   let lastError: ProError | null = null;
@@ -61,12 +67,75 @@ export async function runChatGptJob(job: JobRecord, options: TransportOptions): 
   throw lastError ?? new ProError("UPSTREAM_ERROR", "ChatGPT backend request failed.", { exitCode: EXIT.upstream });
 }
 
+export async function runChatGptResearchTask(task: ResearchTask, options: TransportOptions): Promise<string> {
+  await loadFreshSession(options.sessionTokenPath);
+  const retries = integerOption(options.retries, 0, 0, 5) ?? 0;
+  const retryDelayMs = integerOption(options.retryDelayMs, 500, 0, 60_000) ?? 500;
+  const timeoutMs = integerOption(options.timeoutMs, 0, 0, MAX_REQUEST_TIMEOUT_MS) ?? 0;
+  let lastError: ProError | null = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
+      const cdpBase = options.cdpBase ?? DEFAULT_CDP_BASE;
+      if (isImageTask(task)) {
+        const conversationId = imageConversationIdFromTask(task);
+        if (!conversationId) {
+          throw new ProError("IMAGE_TASK_UNAVAILABLE", "Image generation polling needs a saved conversation id.", {
+            exitCode: EXIT.upstream,
+            suggestions: ["Open the saved ChatGPT conversation to inspect the image generation."],
+            details: { taskId: task.taskId, title: task.title },
+          });
+        }
+        return await waitForImageResult(conversationId, evaluate, cdpBase, timeoutMs, options, {
+          jobId: task.taskId.replace(IMAGE_TASK_PREFIX, "") || task.taskId,
+          prompt: "",
+          initialText: "",
+        });
+      }
+      return await waitForResearchTask(task, evaluate, cdpBase, timeoutMs, options);
+    } catch (error) {
+      const proError = error instanceof ProError ? error : networkError(error);
+      lastError = proError;
+      if (attempt >= retries || !isRetryable(proError)) throw withAttemptDetails(proError, attempt + 1);
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
+    }
+  }
+
+  throw lastError ?? new ProError("UPSTREAM_ERROR", "ChatGPT Deep Research task polling failed.", {
+    exitCode: EXIT.upstream,
+  });
+}
+
+async function loadFreshSession(sessionTokenPath: string): Promise<{ accountId: string }> {
+  const session = await loadSessionToken(sessionTokenPath).catch(() => null);
+  if (!session) {
+    throw new ProError("SESSION_TOKEN_MISSING", "No ChatGPT session token is available.", {
+      exitCode: EXIT.auth,
+      suggestions: ["Run pro-cli auth capture from a logged-in ChatGPT CDP browser."],
+    });
+  }
+  if (!isTokenFresh(session)) {
+    throw new ProError("SESSION_TOKEN_EXPIRED", "The ChatGPT session token is expired.", {
+      exitCode: EXIT.auth,
+      suggestions: ["Run pro-cli auth capture again from a logged-in ChatGPT browser."],
+    });
+  }
+  if (!session.accountId) {
+    throw new ProError("ACCOUNT_ID_MISSING", "The ChatGPT account id is missing from the token.", {
+      exitCode: EXIT.auth,
+      suggestions: ["Run pro-cli auth capture again and confirm ChatGPT is logged in."],
+    });
+  }
+  return { accountId: session.accountId };
+}
+
 async function postChatGptJob(
   job: JobRecord,
   session: { accountId: string },
   options: TransportOptions,
 ): Promise<string> {
-  const timeoutMs = integerOption(options.timeoutMs ?? job.options.timeoutMs, 0, 0, 30 * 60_000) ?? 0;
+  const timeoutMs = integerOption(options.timeoutMs ?? job.options.timeoutMs, 0, 0, MAX_REQUEST_TIMEOUT_MS) ?? 0;
 
   try {
     const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
@@ -74,7 +143,7 @@ async function postChatGptJob(
     let browserResult = await evaluate<BrowserFetchResult>(
       cdpBase,
       buildBrowserFetchExpression(buildRequestBody(job), session.accountId),
-      timeoutMs || 30 * 60_000,
+      timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
     );
     if (!options.pageEvaluator && shouldRecoverCookieBloat(browserResult)) {
       const recovered = await recoverCookieBloatInCdp(cdpBase, chatGptOrigins(), timeoutMs || 10_000).catch(() => null);
@@ -82,7 +151,7 @@ async function postChatGptJob(
         browserResult = await evaluate<BrowserFetchResult>(
           cdpBase,
           buildBrowserFetchExpression(buildRequestBody(job), session.accountId),
-          timeoutMs || 30 * 60_000,
+          timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
         );
       }
     }
@@ -146,7 +215,66 @@ async function postChatGptJob(
       });
     }
 
-    return readResponseText(browserResult.body, options.onLimits);
+    const model = canonicalModelId(job.model);
+    const parsed = readResponse(browserResult.body, options.onLimits, {
+      allowEmptyWithConversation: model === "image",
+    });
+    if (model === "image") {
+      if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
+        throw new ProError("IMAGE_TEMPORARY_UNAVAILABLE", "ChatGPT image generation is not available in temporary chats.", {
+          exitCode: EXIT.upstream,
+          suggestions: ["Use a saved ChatGPT conversation for image generation; omit --temporary."],
+          details: { preview: parsed.text.slice(0, 240), conversationId: parsed.conversationId },
+        });
+      }
+      if (!parsed.conversationId) {
+        throw new ProError("IMAGE_CONVERSATION_MISSING", "ChatGPT did not return a conversation id for image generation.", {
+          exitCode: EXIT.upstream,
+          suggestions: ["Retry only if the user still needs a new real image generation."],
+          details: { preview: parsed.text.slice(0, 240) },
+        });
+      }
+      await options.onResearchTask?.({
+        taskId: imageTaskId(parsed.conversationId),
+        title: "Image generation",
+        conversationId: parsed.conversationId,
+      });
+      return await waitForImageResult(parsed.conversationId, evaluate, cdpBase, timeoutMs, options, {
+        jobId: job.id,
+        prompt: job.prompt,
+        initialText: parsed.text,
+      });
+    }
+    if (model === "research") {
+      const asyncTask = parsed.deepResearchWidget
+        ?? parsed.asyncTask
+        ?? (isDeepResearchAppToolCall(parsed.text) && parsed.conversationId
+          ? await waitForResearchWidgetFromConversation(parsed.conversationId, evaluate, cdpBase)
+          : null)
+        ?? (isIncompleteResearchAcknowledgement(parsed.text) && parsed.conversationId
+          ? await waitForResearchTaskFromConversation(parsed.conversationId, evaluate, cdpBase)
+          : null);
+      if (asyncTask?.taskId) {
+        await options.onResearchTask?.(asyncTask);
+        return await waitForResearchTask(asyncTask, evaluate, cdpBase, timeoutMs, options);
+      }
+      if (isDeepResearchAppToolCall(parsed.text)) {
+        throw new ProError(
+          "RESEARCH_WIDGET_UNAVAILABLE",
+          "Deep Research started the connector widget but pro-cli could not find its widget session.",
+          {
+            exitCode: EXIT.upstream,
+            suggestions: [
+              "Open the saved ChatGPT conversation to inspect the Deep Research widget.",
+              "Retry only if the user still needs a new real Deep Research run; every retry may spend Pro quota.",
+            ],
+            details: { conversationId: parsed.conversationId, preview: parsed.text.slice(0, 240) },
+          },
+        );
+      }
+    }
+    validateCompletedResult(job, parsed.text);
+    return parsed.text;
   } catch (error) {
     if (error instanceof ProError) throw error;
     throw networkError(error);
@@ -863,9 +991,12 @@ interface PreparedChatRequirements {
 }
 
 function buildRequestBody(job: JobRecord): Record<string, unknown> {
-  const prompt = buildConversationPrompt(job);
-  const model = normalizeModel(job.model);
-  const thinkingEffort = modelUsesThinkingEffort(model) ? normalizeReasoning(job.reasoning) : undefined;
+  const requestedModel = canonicalModelId(job.model);
+  const isResearch = requestedModel === "research";
+  const isImage = requestedModel === "image";
+  const prompt = isResearch ? buildResearchPrompt(job) : isImage ? buildImagePrompt(job) : buildConversationPrompt(job);
+  const model = isResearch ? DEEP_RESEARCH_ROUTER_MODEL : isImage ? DEFAULT_MODEL : normalizeModel(job.model);
+  const thinkingEffort = !isResearch && modelUsesThinkingEffort(model) ? normalizeReasoning(job.reasoning) : undefined;
   const conversationId = stringOption(job.options.conversationId);
   const parentMessageId = stringOption(job.options.parentMessageId) ?? "client-created-root";
   const temporary = booleanOption(job.options.temporary, !conversationId);
@@ -882,7 +1013,7 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
         author: { role: "user" },
         create_time: Math.floor(Date.now() / 1000),
         content: { content_type: "text", parts: [prompt] },
-        metadata: {},
+        metadata: isResearch ? deepResearchMessageMetadata() : {},
       },
     ],
     model,
@@ -892,7 +1023,7 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC",
     conversation_mode: { kind: "primary_assistant" },
     enable_message_followups: true,
-    system_hints: [],
+    system_hints: isResearch ? [`connector:${DEEP_RESEARCH_CONNECTOR_ID}`] : [],
     supports_buffering: true,
     supported_encodings: ["v1"],
     client_contextual_info: { app_name: "chatgpt" },
@@ -903,7 +1034,7 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
   if (conversationId) {
     body.conversation_id = conversationId;
   }
-  if (temporary) {
+  if (temporary && !isImage) {
     body.history_and_training_disabled = true;
     body.client_contextual_info = { app_name: "chatgpt.com" };
   }
@@ -917,6 +1048,38 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
   if (thinkingEffort) body.thinking_effort = thinkingEffort;
 
   return body;
+}
+
+function deepResearchMessageMetadata(): Record<string, unknown> {
+  return {
+    caterpillar_selected_sources: ["web"],
+    developer_mode_connector_ids: [],
+    selected_mcp_sources: [],
+    selected_sources: ["web"],
+    selected_github_repos: [],
+    system_hints: [`connector:${DEEP_RESEARCH_CONNECTOR_ID}`],
+    deep_research_version: "standard",
+    venus_model_variant: "standard",
+    serialization_metadata: { custom_symbol_offsets: [] },
+  };
+}
+
+function buildResearchPrompt(job: JobRecord): string {
+  const prompt = job.prompt.trim();
+  const instructions = stringOption(job.options.instructions);
+  if (!instructions?.trim()) return prompt;
+  return `${instructions.trim()}\n\n${prompt}`;
+}
+
+function buildImagePrompt(job: JobRecord): string {
+  const prompt = job.prompt.trim();
+  const imageInstructions =
+    "Use ChatGPT image generation tools to create image(s) from the user's prompt. Do not answer with only a revised prompt. After generation, keep any text brief.";
+  const instructions = [
+    imageInstructions,
+    stringOption(job.options.instructions),
+  ].filter((part): part is string => Boolean(part && part.trim())).join("\n\n");
+  return `${instructions.trim()}\n\n${prompt}`;
 }
 
 function buildConversationPrompt(job: JobRecord): string {
@@ -940,12 +1103,23 @@ function buildConversationPrompt(job: JobRecord): string {
   return `${instructions.trim()}\n\n${prompt}`;
 }
 
-function readResponseText(
+interface ParsedConversationResponse {
+  text: string;
+  asyncTask: ResearchTask | null;
+  deepResearchWidget: ResearchTask | null;
+  conversationId: string | null;
+}
+
+function readResponse(
   raw: string,
   onLimits?: (observations: LimitsObservation[]) => void,
-): string {
+  options: { allowEmptyWithConversation?: boolean } = {},
+): ParsedConversationResponse {
   let buffer = raw.replace(/\r\n?/g, "\n");
   let completedText: string | null = null;
+  let asyncTask: ResearchTask | null = null;
+  let deepResearchWidget: ResearchTask | null = null;
+  let conversationId: string | null = null;
   let completed = false;
   const state: ResponseParseState = { acceptsTextContinuation: false, lastAppendText: null };
 
@@ -962,6 +1136,9 @@ function readResponseText(
       const observations = extractLimitsProgress(event);
       if (observations.length > 0) onLimits(observations);
     }
+    conversationId = extractConversationId(event) ?? conversationId;
+    asyncTask = extractAsyncResearchTask(event) ?? asyncTask;
+    deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
     completed = completed || parsed.completed;
     boundary = buffer.indexOf("\n\n");
   }
@@ -976,6 +1153,9 @@ function readResponseText(
       const observations = extractLimitsProgress(event);
       if (observations.length > 0) onLimits(observations);
     }
+    conversationId = extractConversationId(event) ?? conversationId;
+    asyncTask = extractAsyncResearchTask(event) ?? asyncTask;
+    deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
     completed = completed || parsed.completed;
   }
 
@@ -991,7 +1171,7 @@ function readResponseText(
     });
   }
 
-  if (completedText === null) {
+  if (completedText === null && !asyncTask && !deepResearchWidget && !(options.allowEmptyWithConversation && conversationId)) {
     throw new ProError("EMPTY_RESPONSE", "ChatGPT completed without returning assistant text.", {
       exitCode: EXIT.upstream,
       suggestions: [
@@ -1002,7 +1182,1112 @@ function readResponseText(
     });
   }
 
-  return completedText;
+  return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId };
+}
+
+async function waitForResearchTask(
+  task: ResearchTask,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  timeoutMs: number,
+  options: TransportOptions,
+): Promise<string> {
+  if (isDeepResearchWidgetTask(task)) {
+    return await waitForDeepResearchWidget(task, evaluate, cdpBase, timeoutMs, options);
+  }
+
+  const startedAt = Date.now();
+  let transientPollFailures = 0;
+  while (true) {
+    const remainingMs = timeoutMs > 0 ? Math.max(1, timeoutMs - (Date.now() - startedAt)) : 30_000;
+    let result: BrowserTaskFetchResult;
+    try {
+      result = await evaluate<BrowserTaskFetchResult>(
+        cdpBase,
+        buildResearchTaskFetchExpression(task.taskId),
+        Math.min(remainingMs, 30_000),
+      );
+      transientPollFailures = 0;
+    } catch (error) {
+      const proError = error instanceof ProError ? error : networkError(error);
+      transientPollFailures += 1;
+      const elapsedMs = Date.now() - startedAt;
+      if (!isResearchTaskPollRetryable(proError) || transientPollFailures > 3 || (timeoutMs > 0 && elapsedMs >= timeoutMs)) {
+        throw proError;
+      }
+      await sleep(researchWidgetPollSleepMs(timeoutMs, startedAt));
+      continue;
+    }
+    if (!result.ok) {
+      throw new ProError("RESEARCH_TASK_UNAVAILABLE", `Deep Research task ${task.taskId} returned HTTP ${result.status}.`, {
+        exitCode: EXIT.upstream,
+        suggestions: [
+          "Open the saved ChatGPT conversation to inspect the Deep Research task.",
+          "Retry only if the user still needs a new real Deep Research run; every retry may spend Pro quota.",
+        ],
+        details: {
+          taskId: task.taskId,
+          status: result.status,
+          preview: result.preview,
+        },
+      });
+    }
+
+    const body = isRecord(result.body) ? result.body : {};
+    const status = stringField(body.status)?.toLowerCase() ?? "unknown";
+    await options.onResearchTaskStatus?.({ ...task, status });
+    if (isResearchTaskComplete(status)) {
+      const finalText = readResearchTaskFinalText(body);
+      if (finalText) return finalText;
+      throw new ProError("RESEARCH_TASK_EMPTY", `Deep Research task ${task.taskId} completed without a final message.`, {
+        exitCode: EXIT.upstream,
+        suggestions: ["Open the saved ChatGPT conversation to inspect the completed Deep Research task."],
+        details: { taskId: task.taskId, status },
+      });
+    }
+    if (isResearchTaskFailed(status)) {
+      throw new ProError("RESEARCH_TASK_FAILED", `Deep Research task ${task.taskId} is ${status}.`, {
+        exitCode: EXIT.upstream,
+        suggestions: ["Open the saved ChatGPT conversation to inspect the failed Deep Research task."],
+        details: { taskId: task.taskId, status },
+      });
+    }
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      throw new ProError("RESEARCH_TASK_INCOMPLETE", `Deep Research task ${task.taskId} is still ${status}.`, {
+        exitCode: EXIT.timeout,
+        suggestions: [
+          "Use a larger --timeout for long Deep Research tasks.",
+          "Open the saved ChatGPT conversation if the task appears stuck.",
+        ],
+        details: {
+          taskId: task.taskId,
+          status,
+          title: task.title,
+          conversationId: task.conversationId,
+          elapsedMs: Date.now() - startedAt,
+          timeoutMs,
+        },
+      });
+    }
+    const sleepMs = timeoutMs > 0
+      ? Math.min(DEFAULT_RESEARCH_TASK_POLL_MS, Math.max(1, timeoutMs - (Date.now() - startedAt)))
+      : DEFAULT_RESEARCH_TASK_POLL_MS;
+    await sleep(sleepMs);
+  }
+}
+
+async function waitForDeepResearchWidget(
+  task: ResearchTask,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  timeoutMs: number,
+  options: TransportOptions,
+): Promise<string> {
+  if (!task.conversationId) {
+    throw new ProError("RESEARCH_WIDGET_UNAVAILABLE", "Deep Research widget polling needs a saved conversation id.", {
+      exitCode: EXIT.upstream,
+      suggestions: ["Open the saved ChatGPT conversation to inspect the Deep Research widget."],
+      details: { taskId: task.taskId, title: task.title },
+    });
+  }
+
+  const startedAt = Date.now();
+  let transientPollFailures = 0;
+  while (true) {
+    const remainingMs = timeoutMs > 0 ? Math.max(1, timeoutMs - (Date.now() - startedAt)) : 30_000;
+    let result: BrowserWidgetFetchResult;
+    try {
+      result = await evaluate<BrowserWidgetFetchResult>(
+        cdpBase,
+        buildDeepResearchWidgetFetchExpression(task.conversationId, task.taskId),
+        Math.min(remainingMs, 30_000),
+      );
+      transientPollFailures = 0;
+    } catch (error) {
+      const proError = error instanceof ProError ? error : networkError(error);
+      transientPollFailures += 1;
+      const elapsedMs = Date.now() - startedAt;
+      if (!isResearchTaskPollRetryable(proError) || transientPollFailures > 3 || (timeoutMs > 0 && elapsedMs >= timeoutMs)) {
+        throw proError;
+      }
+      const sleepMs = timeoutMs > 0
+        ? Math.min(DEFAULT_RESEARCH_TASK_POLL_MS, Math.max(1, timeoutMs - elapsedMs))
+        : DEFAULT_RESEARCH_TASK_POLL_MS;
+      await sleep(sleepMs);
+      continue;
+    }
+    if (!result.ok) {
+      if (isTransientResearchWidgetStatus(result.status)) {
+        const status = result.status === 429 ? "rate_limited" : `http_${result.status}`;
+        await options.onResearchTaskStatus?.({ ...task, status });
+        if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+          throw new ProError("RESEARCH_TASK_INCOMPLETE", `Deep Research widget ${task.taskId} is still ${status}.`, {
+            exitCode: EXIT.timeout,
+            suggestions: [
+              "Use a larger --timeout for long Deep Research tasks.",
+              "Open the saved ChatGPT conversation if the widget appears stuck.",
+            ],
+            details: {
+              taskId: task.taskId,
+              status,
+              httpStatus: result.status,
+              title: task.title,
+              conversationId: task.conversationId,
+              elapsedMs: Date.now() - startedAt,
+              timeoutMs,
+              preview: result.preview,
+            },
+          });
+        }
+        await sleep(researchWidgetPollSleepMs(timeoutMs, startedAt, result.status));
+        continue;
+      }
+      throw new ProError(
+        "RESEARCH_WIDGET_UNAVAILABLE",
+        `Deep Research conversation ${task.conversationId} returned HTTP ${result.status}.`,
+        {
+          exitCode: EXIT.upstream,
+          suggestions: ["Open the saved ChatGPT conversation to inspect the Deep Research widget."],
+          details: { taskId: task.taskId, conversationId: task.conversationId, status: result.status, preview: result.preview },
+        },
+      );
+    }
+
+    const status = result.statusText?.toLowerCase() ?? "running";
+    await options.onResearchTaskStatus?.({ ...task, status });
+    if (status === "completed" && result.finalText) return result.finalText;
+    if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+      throw new ProError("RESEARCH_TASK_FAILED", `Deep Research widget ${task.taskId} is ${status}.`, {
+        exitCode: EXIT.upstream,
+        suggestions: ["Open the saved ChatGPT conversation to inspect the failed Deep Research widget."],
+        details: { taskId: task.taskId, conversationId: task.conversationId, status },
+      });
+    }
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      throw new ProError("RESEARCH_TASK_INCOMPLETE", `Deep Research widget ${task.taskId} is still ${status}.`, {
+        exitCode: EXIT.timeout,
+        suggestions: [
+          "Use a larger --timeout for long Deep Research tasks.",
+          "Open the saved ChatGPT conversation if the widget appears stuck.",
+        ],
+        details: {
+          taskId: task.taskId,
+          status,
+          title: result.title ?? task.title,
+          conversationId: task.conversationId,
+          elapsedMs: Date.now() - startedAt,
+          timeoutMs,
+        },
+      });
+    }
+    await sleep(researchWidgetPollSleepMs(timeoutMs, startedAt));
+  }
+}
+
+function researchWidgetPollSleepMs(timeoutMs: number, startedAt: number, status?: number): number {
+  const baseMs = status === 429 ? DEFAULT_RESEARCH_WIDGET_RATE_LIMIT_POLL_MS : DEFAULT_RESEARCH_WIDGET_POLL_MS;
+  return timeoutMs > 0 ? Math.min(baseMs, Math.max(1, timeoutMs - (Date.now() - startedAt))) : baseMs;
+}
+
+function isTransientResearchWidgetStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+interface BrowserTaskFetchResult {
+  ok: boolean;
+  status: number;
+  body: unknown;
+  preview?: string;
+}
+
+interface BrowserWidgetFetchResult {
+  ok: boolean;
+  status: number;
+  statusText: string | null;
+  title: string | null;
+  finalText: string | null;
+  preview?: string;
+}
+
+async function waitForResearchTaskFromConversation(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<ResearchTask | null> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const result = await evaluate<BrowserConversationTaskFetchResult>(
+      cdpBase,
+      buildConversationTaskFetchExpression(conversationId),
+      30_000,
+    );
+    if (result.ok && result.task?.taskId) return result.task;
+    if (!result.ok && result.status !== 404) return null;
+    await sleep(1_000);
+  }
+  return null;
+}
+
+async function waitForResearchWidgetFromConversation(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<ResearchTask | null> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const result = await evaluate<BrowserConversationWidgetFetchResult>(
+      cdpBase,
+      buildConversationWidgetFetchExpression(conversationId),
+      30_000,
+    );
+    if (result.ok && result.task?.taskId) return result.task;
+    if (!result.ok && result.status !== 404) return null;
+    await sleep(1_000);
+  }
+  return null;
+}
+
+interface BrowserConversationTaskFetchResult {
+  ok: boolean;
+  status: number;
+  task: ResearchTask | null;
+  preview?: string;
+}
+
+interface BrowserConversationWidgetFetchResult {
+  ok: boolean;
+  status: number;
+  task: ResearchTask | null;
+  preview?: string;
+}
+
+interface BrowserImageAsset {
+  fileId: string;
+  assetPointer: string;
+  width: number | null;
+  height: number | null;
+  sizeBytes: number | null;
+  title: string | null;
+  genId: string | null;
+}
+
+interface BrowserImageAssetsFetchResult {
+  ok: boolean;
+  status: number;
+  assets: BrowserImageAsset[];
+  asyncStatus: number | null;
+  title: string | null;
+  preview?: string;
+}
+
+interface BrowserImageDownloadResult {
+  ok: boolean;
+  status: number;
+  contentType: string;
+  bytes: number;
+  base64: string;
+  fileName: string | null;
+  error?: string;
+}
+
+interface ImageArtifact {
+  fileId: string;
+  path: string;
+  contentType: string;
+  bytes: number;
+  width: number | null;
+  height: number | null;
+  title: string | null;
+  fileName: string | null;
+  genId: string | null;
+}
+
+interface ImageGenerationResult {
+  type: "image_generation";
+  conversationId: string;
+  text: string | null;
+  images: ImageArtifact[];
+}
+
+async function waitForImageResult(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  timeoutMs: number,
+  options: TransportOptions,
+  context: { jobId: string; prompt: string; initialText: string },
+): Promise<string> {
+  const artifactDir = options.artifactDir;
+  if (!artifactDir) {
+    throw new ProError("IMAGE_ARTIFACT_DIR_MISSING", "Image generation needs a local artifact directory.", {
+      exitCode: EXIT.internal,
+      suggestions: ["Retry through pro-cli ask or job create so artifact storage is configured."],
+      details: { conversationId },
+    });
+  }
+
+  const startedAt = Date.now();
+  while (true) {
+    const remainingMs = timeoutMs > 0 ? Math.max(1, timeoutMs - (Date.now() - startedAt)) : 30_000;
+    const result = await evaluate<BrowserImageAssetsFetchResult>(
+      cdpBase,
+      buildImageAssetsFetchExpression(conversationId),
+      Math.min(remainingMs, 30_000),
+    );
+
+    if (!result.ok) {
+      if (isTransientImageStatus(result.status)) {
+        const status = result.status === 429 ? "rate_limited" : `http_${result.status}`;
+        await options.onResearchTaskStatus?.({
+          taskId: imageTaskId(conversationId),
+          title: result.title ?? "Image generation",
+          conversationId,
+          status,
+        });
+        if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+          throw imageIncompleteError(conversationId, status, timeoutMs, startedAt, result.preview);
+        }
+        await sleep(imagePollSleepMs(timeoutMs, startedAt, result.status));
+        continue;
+      }
+      throw new ProError("IMAGE_ASSETS_UNAVAILABLE", `Image conversation ${conversationId} returned HTTP ${result.status}.`, {
+        exitCode: EXIT.upstream,
+        suggestions: ["Open the saved ChatGPT conversation to inspect the image generation."],
+        details: { conversationId, status: result.status, preview: result.preview },
+      });
+    }
+
+    if (result.assets.length > 0) {
+      await options.onResearchTaskStatus?.({
+        taskId: imageTaskId(conversationId),
+        title: result.title ?? "Image generation",
+        conversationId,
+        status: "completed",
+      });
+      await mkdir(artifactDir, { recursive: true, mode: 0o700 });
+      const images: ImageArtifact[] = [];
+      for (const [index, asset] of result.assets.entries()) {
+        const download = await downloadImageAsset(asset.fileId, evaluate, cdpBase);
+        const extension = imageExtension(download.contentType);
+        const path = join(artifactDir, `image-${index + 1}.${extension}`);
+        await writeFile(path, Buffer.from(download.base64, "base64"), { mode: 0o600 });
+        images.push({
+          fileId: asset.fileId,
+          path,
+          contentType: download.contentType,
+          bytes: download.bytes,
+          width: asset.width,
+          height: asset.height,
+          title: asset.title,
+          fileName: fileBaseName(download.fileName),
+          genId: asset.genId,
+        });
+      }
+      const payload: ImageGenerationResult = {
+        type: "image_generation",
+        conversationId,
+        text: context.initialText.trim() ? context.initialText : null,
+        images,
+      };
+      return JSON.stringify(payload, null, 2);
+    }
+
+    const status = result.asyncStatus === 4 ? "final_without_assets" : "running";
+    await options.onResearchTaskStatus?.({
+      taskId: imageTaskId(conversationId),
+      title: result.title ?? "Image generation",
+      conversationId,
+      status,
+    });
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      throw imageIncompleteError(conversationId, status, timeoutMs, startedAt, result.preview);
+    }
+    await sleep(imagePollSleepMs(timeoutMs, startedAt));
+  }
+}
+
+async function downloadImageAsset(
+  fileId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<BrowserImageDownloadResult> {
+  const result = await evaluate<BrowserImageDownloadResult>(
+    cdpBase,
+    buildImageDownloadExpression(fileId),
+    60_000,
+  );
+  if (!result.ok || !result.contentType.startsWith("image/")) {
+    throw new ProError("IMAGE_DOWNLOAD_UNAVAILABLE", `Image file ${fileId} could not be downloaded.`, {
+      exitCode: EXIT.upstream,
+      suggestions: ["Open the saved ChatGPT conversation to inspect or download the image manually."],
+      details: {
+        fileId,
+        status: result.status,
+        contentType: result.contentType,
+        error: result.error,
+      },
+    });
+  }
+  return result;
+}
+
+function imageIncompleteError(
+  conversationId: string,
+  status: string,
+  timeoutMs: number,
+  startedAt: number,
+  preview?: string,
+): ProError {
+  return new ProError("IMAGE_TASK_INCOMPLETE", `Image generation ${conversationId} is still ${status}.`, {
+    exitCode: EXIT.timeout,
+    suggestions: [
+      "Use a larger --timeout for long image generations.",
+      "Open the saved ChatGPT conversation if the image appears stuck.",
+    ],
+    details: {
+      conversationId,
+      status,
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs,
+      preview,
+    },
+  });
+}
+
+function imagePollSleepMs(timeoutMs: number, startedAt: number, status?: number): number {
+  const baseMs = status === 429 ? DEFAULT_IMAGE_RATE_LIMIT_POLL_MS : DEFAULT_IMAGE_POLL_MS;
+  return timeoutMs > 0 ? Math.min(baseMs, Math.max(1, timeoutMs - (Date.now() - startedAt))) : baseMs;
+}
+
+function isTransientImageStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function isImageTask(task: ResearchTask): boolean {
+  return task.taskId.startsWith(IMAGE_TASK_PREFIX);
+}
+
+function imageTaskId(conversationId: string): string {
+  return `${IMAGE_TASK_PREFIX}${conversationId}`;
+}
+
+function imageConversationIdFromTask(task: ResearchTask): string | null {
+  if (task.conversationId) return task.conversationId;
+  if (task.taskId.startsWith(IMAGE_TASK_PREFIX)) return task.taskId.slice(IMAGE_TASK_PREFIX.length);
+  return null;
+}
+
+function imageExtension(contentType: string): string {
+  if (contentType.includes("png")) return "png";
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+  if (contentType.includes("webp")) return "webp";
+  return "bin";
+}
+
+function fileBaseName(value: string | null): string | null {
+  if (!value) return null;
+  return value.split(/[\\/]/).filter(Boolean).pop() ?? value;
+}
+
+function validateCompletedResult(job: JobRecord, text: string): void {
+  const model = canonicalModelId(job.model);
+  if (model !== "research" || !isIncompleteResearchAcknowledgement(text)) return;
+  throw new ProError(
+    "INCOMPLETE_RESEARCH_ACK",
+    "Deep Research returned only an acknowledgement instead of the completed research artifact.",
+    {
+      exitCode: EXIT.upstream,
+      suggestions: [
+        "Open the saved ChatGPT conversation to see whether Deep Research continued asynchronously.",
+        "Retry only if the user still needs a new real Deep Research run; do not send probe or smoke-test queries.",
+        "For an immediate terminal artifact, use --model gpt-5-5-pro --reasoning extended with a source packet while Deep Research async retrieval is unavailable.",
+      ],
+      details: {
+        model,
+        reasoning: job.reasoning,
+        chars: text.length,
+        preview: text.slice(0, 240),
+      },
+    },
+  );
+}
+
+function isIncompleteResearchAcknowledgement(text: string): boolean {
+  const trimmed = researchAcknowledgementCandidate(text).trim();
+  if (!trimmed) return false;
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  if (wordCount > 350) return false;
+
+  const normalized = trimmed
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  const promisesFutureWork =
+    /\bi(?:'ll| will)\s+(?:begin|start|conduct|do|run|perform|research|investigate|look into|analy[sz]e|prepare|compile|return|provide|deliver)\b/.test(
+      normalized,
+    ) ||
+    /\bi(?:'ll| will)\s+(?:get back|come back|follow up)\b/.test(normalized);
+  if (!promisesFutureWork) return false;
+
+  const explicitlyLater =
+    /\b(?:shortly|once (?:complete|completed|done)|when (?:complete|completed|done)|after (?:the )?research)\b/.test(
+      normalized,
+    ) || /\b(?:get back|come back|follow up)\s+to you\b/.test(normalized) || /\bi(?:'ll| will)\s+return\b/.test(normalized);
+  const hasCompletedResearchMarkers =
+    /(?:^|\n)\s*(?:executive summary|findings|sources|references|claims|report|conclusion|recommendation|rationale)\s*:/i.test(
+      trimmed,
+    );
+  return explicitlyLater && !hasCompletedResearchMarkers;
+}
+
+function researchAcknowledgementCandidate(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return text;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!isRecord(parsed) || typeof parsed.response !== "string") return text;
+    const prompt = typeof parsed.prompt === "string" ? parsed.prompt : "";
+    const title = typeof parsed.title === "string" ? parsed.title : "";
+    const looksLikeResearchStartEnvelope =
+      typeof parsed.task_violates_safety_guidelines === "boolean" ||
+      typeof parsed.user_def_doesnt_want_research === "boolean" ||
+      prompt.toLowerCase().includes("deep analysis") ||
+      title.toLowerCase().includes("research");
+    return looksLikeResearchStartEnvelope ? parsed.response : text;
+  } catch {
+    return text;
+  }
+}
+
+function buildResearchTaskFetchExpression(taskId: string): string {
+  return `(${async function fetchResearchTask(id: string): Promise<BrowserTaskFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/task/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const text = await response.text().catch(() => "");
+    let body: unknown = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      body,
+      preview: text.replace(/\s+/g, " ").slice(0, 240),
+    };
+  }})(${JSON.stringify(taskId)})`;
+}
+
+function buildConversationWidgetFetchExpression(conversationId: string): string {
+  return `(${async function fetchConversationWidget(id: string): Promise<BrowserConversationWidgetFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const body = (await response.json().catch(() => null)) as { mapping?: unknown } | null;
+    const mapping = body && typeof body === "object" && body.mapping && typeof body.mapping === "object"
+      ? body.mapping as Record<string, { message?: unknown }>
+      : {};
+    for (const node of Object.values(mapping)) {
+      const task = readDeepResearchWidgetTaskFromMessage(node?.message, id);
+      if (task) return { ok: response.ok, status: response.status, task };
+    }
+    return { ok: response.ok, status: response.status, task: null, preview: JSON.stringify(body).slice(0, 240) };
+
+    function readDeepResearchWidgetTaskFromMessage(message: unknown, conversationId: string): ResearchTask | null {
+      const metadata = (message as { metadata?: unknown } | undefined)?.metadata;
+      if (!metadata || typeof metadata !== "object") return null;
+      const sdk = (metadata as Record<string, unknown>).chatgpt_sdk;
+      if (!sdk || typeof sdk !== "object") return null;
+      const sdkRecord = sdk as Record<string, unknown>;
+      const toolMetadata = sdkRecord.tool_response_metadata;
+      const toolRecord = toolMetadata && typeof toolMetadata === "object" ? toolMetadata as Record<string, unknown> : {};
+      const attributionId = typeof sdkRecord.attribution_id === "string" ? sdkRecord.attribution_id : "";
+      const resolvedUri = typeof sdkRecord.resolved_pineapple_uri === "string" ? sdkRecord.resolved_pineapple_uri : "";
+      if (attributionId !== "connector_openai_deep_research" && resolvedUri !== "connectors://connector_openai_deep_research") {
+        return null;
+      }
+      const taskId =
+        typeof sdkRecord.widget_session_id === "string" && sdkRecord.widget_session_id
+          ? sdkRecord.widget_session_id
+          : typeof toolRecord["openai/widgetSessionId"] === "string" && toolRecord["openai/widgetSessionId"]
+            ? toolRecord["openai/widgetSessionId"] as string
+            : typeof toolRecord.async_task_conversation_id === "string" && toolRecord.async_task_conversation_id
+              ? toolRecord.async_task_conversation_id
+              : "";
+      if (!taskId) return null;
+      const title = readWidgetTitle(sdkRecord.widget_state) || readWidgetTitle(toolRecord.venus_widget_state);
+      return {
+        taskId,
+        ...(title ? { title } : {}),
+        conversationId,
+      };
+    }
+
+    function readWidgetTitle(raw: unknown): string | null {
+      const state = parseState(raw);
+      const plan = state && typeof state.plan === "object" && state.plan ? state.plan as Record<string, unknown> : null;
+      return typeof plan?.title === "string" && plan.title ? plan.title : null;
+    }
+
+    function parseState(raw: unknown): Record<string, unknown> | null {
+      if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+      if (typeof raw !== "string" || !raw.trim()) return null;
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+      } catch {
+        return null;
+      }
+    }
+  }})(${JSON.stringify(conversationId)})`;
+}
+
+function buildDeepResearchWidgetFetchExpression(conversationId: string, taskId: string): string {
+  return `(${async function fetchDeepResearchWidget(id: string, expectedTaskId: string): Promise<BrowserWidgetFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const body = (await response.json().catch(() => null)) as { mapping?: unknown } | null;
+    const mapping = body && typeof body === "object" && body.mapping && typeof body.mapping === "object"
+      ? body.mapping as Record<string, { message?: unknown }>
+      : {};
+    const candidates: Array<{ status: string | null; title: string | null; finalText: string | null; matched: boolean }> = [];
+    for (const node of Object.values(mapping)) {
+      candidates.push(...readWidgetCandidates(node?.message, expectedTaskId));
+    }
+    const matched = candidates.filter((candidate) => candidate.matched);
+    const selected = [...matched, ...candidates]
+      .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0] ?? null;
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: selected?.status ?? null,
+      title: selected?.title ?? null,
+      finalText: selected?.finalText ?? null,
+      preview: JSON.stringify(body).slice(0, 240),
+    };
+
+    function scoreCandidate(candidate: { status: string | null; finalText: string | null; matched: boolean }): number {
+      return (candidate.matched ? 100 : 0) + (candidate.status === "completed" ? 10 : 0) + (candidate.finalText ? 1 : 0);
+    }
+
+    function readWidgetCandidates(
+      message: unknown,
+      expectedTaskId: string,
+    ): Array<{ status: string | null; title: string | null; finalText: string | null; matched: boolean }> {
+      const msg = message as { content?: { text?: unknown; parts?: unknown }; metadata?: unknown } | undefined;
+      if (!msg) return [];
+      const metadata = msg.metadata && typeof msg.metadata === "object" ? msg.metadata as Record<string, unknown> : {};
+      const sdk = metadata.chatgpt_sdk && typeof metadata.chatgpt_sdk === "object"
+        ? metadata.chatgpt_sdk as Record<string, unknown>
+        : {};
+      const toolMetadata = sdk.tool_response_metadata;
+      const toolRecord = toolMetadata && typeof toolMetadata === "object" ? toolMetadata as Record<string, unknown> : {};
+      const ids = [
+        typeof sdk.widget_session_id === "string" ? sdk.widget_session_id : "",
+        typeof toolRecord["openai/widgetSessionId"] === "string" ? toolRecord["openai/widgetSessionId"] as string : "",
+        typeof toolRecord.async_task_conversation_id === "string" ? toolRecord.async_task_conversation_id : "",
+      ].filter(Boolean);
+      const matched = ids.includes(expectedTaskId);
+      const states: unknown[] = [sdk.widget_state, metadata.venus_widget_state, toolRecord.venus_widget_state];
+      const text = typeof msg.content?.text === "string"
+        ? msg.content.text
+        : Array.isArray(msg.content?.parts)
+          ? msg.content.parts.filter((part): part is string => typeof part === "string").join("")
+          : "";
+      const textMatch = text.match(/The latest state of the widget is: (\\{[\\s\\S]*\\})/);
+      if (textMatch?.[1]) states.push(textMatch[1]);
+      return states.flatMap((raw) => {
+        const state = parseState(raw);
+        if (!state) return [];
+        const finalText = readFinalText(state);
+        const title = readTitle(state);
+        const status = typeof state.status === "string" ? state.status : finalText ? "completed" : null;
+        if (!status && !finalText && !title) return [];
+        return [{ status, title, finalText, matched }];
+      });
+    }
+
+    function parseState(raw: unknown): Record<string, unknown> | null {
+      if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+      if (typeof raw !== "string" || !raw.trim()) return null;
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function readTitle(state: Record<string, unknown>): string | null {
+      const plan = state.plan && typeof state.plan === "object" ? state.plan as Record<string, unknown> : null;
+      return typeof plan?.title === "string" && plan.title ? plan.title : null;
+    }
+
+    function readFinalText(state: Record<string, unknown>): string | null {
+      const report = state.report_message;
+      const content = report && typeof report === "object" ? (report as { content?: unknown }).content : null;
+      if (!content || typeof content !== "object") return null;
+      const record = content as { parts?: unknown; text?: unknown };
+      if (Array.isArray(record.parts)) {
+        const text = record.parts.filter((part): part is string => typeof part === "string").join("");
+        if (text.trim()) return text;
+      }
+      return typeof record.text === "string" && record.text.trim() ? record.text : null;
+    }
+  }})(${JSON.stringify(conversationId)}, ${JSON.stringify(taskId)})`;
+}
+
+function buildConversationTaskFetchExpression(conversationId: string): string {
+  return `(${async function fetchConversationResearchTask(id: string): Promise<BrowserConversationTaskFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const body = (await response.json().catch(() => null)) as { mapping?: unknown } | null;
+    const mapping = body && typeof body === "object" && body.mapping && typeof body.mapping === "object"
+      ? body.mapping as Record<string, { message?: unknown }>
+      : {};
+    for (const node of Object.values(mapping)) {
+      const message = node?.message as { metadata?: unknown } | undefined;
+      const metadata = message?.metadata;
+      if (!metadata || typeof metadata !== "object") continue;
+      const record = metadata as Record<string, unknown>;
+      const taskId = typeof record.async_task_id === "string" ? record.async_task_id : "";
+      if (!taskId) continue;
+      return {
+        ok: response.ok,
+        status: response.status,
+        task: {
+          taskId,
+          ...(typeof record.async_task_title === "string" ? { title: record.async_task_title } : {}),
+          ...(typeof record.async_task_conversation_id === "string"
+            ? { conversationId: record.async_task_conversation_id }
+            : {}),
+        },
+      };
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      task: null,
+      preview: JSON.stringify(body).slice(0, 240),
+    };
+  }})(${JSON.stringify(conversationId)})`;
+}
+
+function buildImageAssetsFetchExpression(conversationId: string): string {
+  return `(${async function fetchConversationImages(id: string): Promise<BrowserImageAssetsFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const text = await response.text().catch(() => "");
+    let body: unknown = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    const record = body && typeof body === "object" ? body as Record<string, unknown> : {};
+    const mapping = record.mapping && typeof record.mapping === "object"
+      ? record.mapping as Record<string, { message?: unknown }>
+      : {};
+    const assets: BrowserImageAsset[] = [];
+    for (const node of Object.values(mapping)) {
+      const message = node?.message as { content?: unknown; metadata?: unknown } | undefined;
+      if (!message || typeof message !== "object") continue;
+      const metadata = message.metadata && typeof message.metadata === "object"
+        ? message.metadata as Record<string, unknown>
+        : {};
+      const content = message.content && typeof message.content === "object"
+        ? message.content as { parts?: unknown }
+        : {};
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      for (const part of parts) {
+        if (!part || typeof part !== "object") continue;
+        const image = part as Record<string, unknown>;
+        if (image.content_type !== "image_asset_pointer") continue;
+        const assetPointer = typeof image.asset_pointer === "string" ? image.asset_pointer : "";
+        const fileId = assetPointer.replace(/^sediment:\/\//, "");
+        if (!assetPointer || !fileId) continue;
+        const imageMetadata = image.metadata && typeof image.metadata === "object"
+          ? image.metadata as Record<string, unknown>
+          : {};
+        const generation = imageMetadata.generation && typeof imageMetadata.generation === "object"
+          ? imageMetadata.generation as Record<string, unknown>
+          : {};
+        assets.push({
+          fileId,
+          assetPointer,
+          width: typeof image.width === "number" ? image.width : null,
+          height: typeof image.height === "number" ? image.height : null,
+          sizeBytes: typeof image.size_bytes === "number" ? image.size_bytes : null,
+          title: typeof metadata.image_gen_title === "string" ? metadata.image_gen_title : null,
+          genId: typeof generation.gen_id === "string" ? generation.gen_id : null,
+        });
+      }
+    }
+    const seen = new Set<string>();
+    const deduped = assets.filter((asset) => {
+      if (seen.has(asset.fileId)) return false;
+      seen.add(asset.fileId);
+      return true;
+    });
+    return {
+      ok: response.ok,
+      status: response.status,
+      assets: deduped,
+      asyncStatus: typeof record.async_status === "number" ? record.async_status : null,
+      title: typeof record.title === "string" ? record.title : null,
+      preview: text.replace(/\s+/g, " ").slice(0, 240),
+    };
+  }})(${JSON.stringify(conversationId)})`;
+}
+
+function buildImageDownloadExpression(fileId: string): string {
+  return `(${async function downloadImageFile(id: string): Promise<BrowserImageDownloadResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const metadataResponse = await fetch(
+      `https://chatgpt.com/backend-api/files/download/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const metadata = (await metadataResponse.json().catch(() => null)) as
+      | { download_url?: unknown; file_name?: unknown }
+      | null;
+    if (!metadataResponse.ok || typeof metadata?.download_url !== "string") {
+      return {
+        ok: false,
+        status: metadataResponse.status,
+        contentType: "",
+        bytes: 0,
+        base64: "",
+        fileName: null,
+        error: "download metadata did not include download_url",
+      };
+    }
+
+    const imageResponse = await fetch(metadata.download_url, {
+      credentials: "include",
+      referrer: "https://chatgpt.com/",
+    });
+    const buffer = await imageResponse.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.slice(index, index + 0x8000));
+    }
+    return {
+      ok: imageResponse.ok,
+      status: imageResponse.status,
+      contentType: imageResponse.headers.get("content-type") ?? "application/octet-stream",
+      bytes: bytes.length,
+      base64: btoa(binary),
+      fileName: typeof metadata.file_name === "string" ? metadata.file_name : null,
+    };
+  }})(${JSON.stringify(fileId)})`;
+}
+
+function extractAsyncResearchTask(event: unknown): ResearchTask | null {
+  if (!isRecord(event)) return null;
+  const value = event.v as { message?: unknown } | undefined;
+  const message = (event.message ?? value?.message) as { metadata?: unknown } | undefined;
+  const metadata = message?.metadata;
+  if (!isRecord(metadata)) return null;
+  const taskId = stringField(metadata.async_task_id);
+  if (!taskId) return null;
+  return {
+    taskId,
+    ...(typeof metadata.async_task_title === "string" ? { title: metadata.async_task_title } : {}),
+    ...(typeof metadata.async_task_conversation_id === "string"
+      ? { conversationId: metadata.async_task_conversation_id }
+      : {}),
+  };
+}
+
+function extractDeepResearchWidgetTask(event: unknown, conversationId: string | null): ResearchTask | null {
+  if (!isRecord(event)) return null;
+  const value = event.v as { message?: unknown } | undefined;
+  const message = (event.message ?? value?.message) as { metadata?: unknown } | undefined;
+  const metadata = message?.metadata;
+  if (!isRecord(metadata)) return null;
+  const sdk = metadata.chatgpt_sdk;
+  if (!isRecord(sdk)) return null;
+  const toolMetadata = sdk.tool_response_metadata;
+  const toolRecord = isRecord(toolMetadata) ? toolMetadata : {};
+  const attributionId = stringField(sdk.attribution_id);
+  const resolvedUri = stringField(sdk.resolved_pineapple_uri);
+  if (attributionId !== DEEP_RESEARCH_CONNECTOR_ID && resolvedUri !== `connectors://${DEEP_RESEARCH_CONNECTOR_ID}`) {
+    return null;
+  }
+
+  const taskId =
+    stringField(sdk.widget_session_id)
+    ?? stringField(toolRecord["openai/widgetSessionId"])
+    ?? stringField(toolRecord.async_task_conversation_id);
+  if (!taskId) return null;
+  const title = readDeepResearchWidgetTitle(sdk.widget_state) ?? readDeepResearchWidgetTitle(toolRecord.venus_widget_state);
+  return {
+    taskId,
+    ...(title ? { title } : {}),
+    ...(conversationId ? { conversationId } : {}),
+  };
+}
+
+function extractConversationId(event: unknown): string | null {
+  if (!isRecord(event)) return null;
+  if (typeof event.conversation_id === "string" && event.conversation_id) return event.conversation_id;
+  const value = event.v;
+  if (isRecord(value) && typeof value.conversation_id === "string" && value.conversation_id) {
+    return value.conversation_id;
+  }
+  return null;
+}
+
+function readResearchTaskFinalText(task: Record<string, unknown>): string | null {
+  const finalText = readMessageContentText(task.final_message);
+  if (finalText) return finalText;
+  const messages = Array.isArray(task.messages) ? task.messages : [];
+  for (const message of [...messages].reverse()) {
+    const text = readMessageContentText(message);
+    if (text) return text;
+  }
+  return null;
+}
+
+function isDeepResearchWidgetTask(task: ResearchTask): boolean {
+  return !task.taskId.startsWith("deepresch_");
+}
+
+function isDeepResearchAppToolCall(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!isRecord(parsed)) return false;
+    return stringField(parsed.path)?.includes(`/Deep Research App/implicit_link::${DEEP_RESEARCH_CONNECTOR_ID}/`) === true;
+  } catch {
+    return false;
+  }
+}
+
+function readDeepResearchWidgetTitle(value: unknown): string | null {
+  const state = parseDeepResearchWidgetState(value);
+  const plan = state && isRecord(state.plan) ? state.plan : null;
+  return stringField(plan?.title) ?? null;
+}
+
+function parseDeepResearchWidgetState(value: unknown): Record<string, unknown> | null {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readDeepResearchWidgetFinalText(state: Record<string, unknown>): string | null {
+  const report = state.report_message;
+  const text = readMessageContentText(report);
+  if (text) return text;
+  if (isRecord(report)) {
+    const content = report.content;
+    if (isRecord(content) && typeof content.text === "string" && content.text.trim()) return content.text;
+  }
+  return null;
+}
+
+function isResearchTaskComplete(status: string): boolean {
+  return ["completed", "complete", "succeeded", "success", "done"].includes(status);
+}
+
+function isResearchTaskFailed(status: string): boolean {
+  return ["failed", "failure", "error", "cancelled", "canceled"].includes(status);
 }
 
 interface ResponseParseState {
@@ -1095,11 +2380,14 @@ function parseSseFrame(frame: string): unknown {
 
 function readConversationMessageText(event: Record<string, unknown>): string | null {
   const value = event.v as { message?: unknown } | undefined;
-  const message = (event.message ?? value?.message) as { author?: unknown; content?: unknown } | undefined;
+  const message = (event.message ?? value?.message) as { author?: unknown } | undefined;
   const author = message?.author as { role?: unknown } | undefined;
   if (author?.role !== "assistant") return null;
+  return readMessageContentText(message);
+}
 
-  const content = message?.content as { parts?: unknown } | undefined;
+function readMessageContentText(message: unknown): string | null {
+  const content = (message as { content?: { parts?: unknown } } | undefined)?.content;
   if (!Array.isArray(content?.parts)) return null;
 
   const parts = content.parts.filter((part): part is string => typeof part === "string");
@@ -1181,6 +2469,10 @@ function stringOption(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function integerOption(
   value: unknown,
   fallback: number | undefined,
@@ -1210,9 +2502,23 @@ function networkError(error: unknown): ProError {
 }
 
 function isRetryable(error: ProError): boolean {
-  if (["NETWORK_ERROR", "REQUEST_TIMEOUT", "STREAM_INCOMPLETE"].includes(error.code)) return true;
+  if (isAsyncArtifactError(error.code)) return false;
+  if (["NETWORK_ERROR", "REQUEST_TIMEOUT", "STREAM_INCOMPLETE", "CDP_TIMEOUT"].includes(error.code)) return true;
   const status = error.details?.status;
   return typeof status === "number" && (status === 408 || status === 429 || status >= 500);
+}
+
+function isAsyncArtifactError(code: string): boolean {
+  return (
+    code.startsWith("IMAGE_") ||
+    code.startsWith("RESEARCH_TASK_") ||
+    code.startsWith("RESEARCH_WIDGET_") ||
+    code === "INCOMPLETE_RESEARCH_ACK"
+  );
+}
+
+function isResearchTaskPollRetryable(error: ProError): boolean {
+  return ["CDP_TIMEOUT", "NETWORK_ERROR", "REQUEST_TIMEOUT"].includes(error.code);
 }
 
 function withAttemptDetails(error: ProError, attempts: number): ProError {

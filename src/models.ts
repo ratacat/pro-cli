@@ -45,6 +45,10 @@ const MODEL_ID_ALIASES = new Map<string, string>([
   ["deep research", "research"],
   ["deep-research", "research"],
   ["deep_research", "research"],
+  ["images", "image"],
+  ["image generation", "image"],
+  ["image-generation", "image"],
+  ["image_generation", "image"],
 ]);
 
 const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
@@ -85,6 +89,15 @@ const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
     reasoningType: "pro",
     configurableThinkingEffort: true,
   },
+  {
+    id: "image",
+    label: "Image Generation",
+    source: "static-unverified",
+    reasoningLevels: ["standard", "extended"],
+    reasoningType: "pro",
+    configurableThinkingEffort: true,
+    enabledTools: ["image_gen_tool_enabled"],
+  },
 ];
 
 const STATIC_MODEL_BY_ID = new Map(STATIC_MODEL_CAPABILITIES.map((model) => [model.id, model]));
@@ -102,7 +115,8 @@ export function modelUsesThinkingEffort(model: string): boolean {
 }
 
 export function modelRequiresSavedConversation(model: string): boolean {
-  return canonicalModelId(model) === "research";
+  const canonical = canonicalModelId(model);
+  return canonical === "research" || canonical === "image";
 }
 
 export async function listModels(options: { sessionTokenPath: string }): Promise<ModelList> {
@@ -148,7 +162,7 @@ export async function listModels(options: { sessionTokenPath: string }): Promise
       ...(typeof payload.model_picker_version === "number"
         ? { modelPickerVersion: payload.model_picker_version }
         : {}),
-      models: liveModels.map((model) => ({
+      models: withPseudoModels(liveModels).map((model) => ({
         ...model,
         default: model.id === DEFAULT_MODEL,
       })),
@@ -156,6 +170,15 @@ export async function listModels(options: { sessionTokenPath: string }): Promise
   } catch {
     return listStaticModels("Live model discovery failed; using static fallback.");
   }
+}
+
+function withPseudoModels(models: ModelCapability[]): ModelCapability[] {
+  const ids = new Set(models.map((model) => canonicalModelId(model.id)));
+  const additions = STATIC_MODEL_CAPABILITIES
+    .filter((model) => model.id === "image")
+    .filter((model) => !ids.has(model.id))
+    .map((model) => ({ ...model, reasoningLevels: [...model.reasoningLevels] }));
+  return [...models, ...additions];
 }
 
 export function listStaticModels(warning?: string): ModelList {

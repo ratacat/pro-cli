@@ -6,7 +6,7 @@
 
 Agent native CLI for querying ChatGPT Pro and Deep Research through your own logged-in web session, managed from your terminal.
 
-`pro-cli` gives coding agents a JSON-first command surface for the ChatGPT web account you already use: Pro models, thinking levels, Deep Research-style capabilities when available to your account, structured JSON outputs with schema validation, calibrated probability scoring, async jobs, and recoverable results.
+`pro-cli` gives coding agents a JSON-first command surface for the ChatGPT web account you already use: Pro models, thinking levels, Deep Research-style capabilities when available to your account, ChatGPT image generation, structured JSON outputs with schema validation, calibrated probability scoring, async jobs, and recoverable results.
 
 `pro-cli` is built for legal ChatGPT subscribers using their own session. It does not bypass authentication, subscriptions, rate limits, access controls, or account restrictions.
 
@@ -127,6 +127,7 @@ pro-cli job create @prompt.md --json
 pro-cli job create @prompt.md --wait --json
 pro-cli job create @prompt.md --reasoning extended --json
 pro-cli job create @prompt.md --condensed-response 500 --json
+pro-cli job create "Create one square icon of a red kite on white" --model image --wait --json
 pro-cli job wait <job-id> --json
 pro-cli job wait <job-id> --soft-timeout 60000 --json
 pro-cli job result <job-id> --json
@@ -157,6 +158,31 @@ pro-cli ask @prompt.md --condensed_response=500 --json
 Use `--condensed-response <tokens>` when Pro should keep the final answer within an approximate response budget. The underscore alias `--condensed_response=<tokens>` is also accepted for agents. This is a prompt-level instruction, not a second summarization call, so it does not spend extra Pro quota.
 
 JSON responses that include full Pro text also include `agentInstruction` and `resultStats`. Agents should treat `data.result` as the primary deliverable. Results under 6000 characters should usually be relayed in full; longer results may be condensed with care for the original prose, structure, and voice.
+
+## Image Generation
+
+Use `--model image` to create images through the logged-in ChatGPT web session:
+
+```sh
+pro-cli job create "Create one square flat vector icon of a blue paper boat on white, no text" \
+  --model image --wait --json
+```
+
+Image generation is async and uses a saved ChatGPT conversation. Temporary chats cannot create images in ChatGPT, so `--model image` rejects `--temporary` and `--store false`.
+
+Generated files are downloaded to:
+
+```txt
+~/.pro-cli/images/<job-id>/image-1.png
+```
+
+The job result is a JSON string with `type: "image_generation"`, the ChatGPT `conversationId`, and an `images` array containing local `path`, `contentType`, `bytes`, `width`, `height`, `title`, and source file ids.
+
+Image jobs default to a 10-minute request timeout. Increase it for complex generations:
+
+```sh
+pro-cli job create @image-prompt.md --model image --wait --timeout 1200000 --json
+```
 
 Probability and plan:
 
@@ -220,6 +246,8 @@ ChatGPT does not expose a standalone limits endpoint, so counters refresh whenev
 ## Conversations
 
 New `ask` and `job create` requests default to temporary ChatGPT conversations. Use `--save` when the turn should be written to ChatGPT history.
+
+Deep Research and image generation require saved conversations because ChatGPT completes those workflows asynchronously outside the initial response stream.
 
 Continuing a conversation defaults to saved mode and requires both ids from the ChatGPT conversation:
 

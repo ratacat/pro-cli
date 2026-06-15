@@ -2,9 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
+import { resolvePaths } from "../src/config";
 import { ProError } from "../src/errors";
 import {
   buildEphemeralJob,
+  executeClaimedJob,
   waitForJob,
   waitForTerminalJob,
   waitTimeoutError,
@@ -229,6 +231,82 @@ describe("buildEphemeralJob", () => {
   });
 });
 
+describe("executeClaimedJob research task durability", () => {
+  test("persists launched Deep Research task metadata before returning the final result", async () => {
+    await withStore(async (store) => {
+      const created = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      const claimed = store.claimQueued(created.id);
+      if (!claimed) throw new Error("Expected claimed job.");
+
+      const result = await executeClaimedJob(store, claimed, testPaths(), {
+        runJob: async (_job, options) => {
+          await options.onResearchTask?.({
+            taskId: "deepresch_started",
+            title: "Research task",
+            conversationId: "conversation-1",
+          });
+          await options.onResearchTaskStatus?.({ taskId: "deepresch_started", status: "completed" });
+          return "final report";
+        },
+      });
+
+      expect(result.result).toBe("final report");
+      expect(store.get(created.id).status).toBe("succeeded");
+      const task = store.getResearchTask(created.id);
+      expect(task?.taskId).toBe("deepresch_started");
+      expect(task?.conversationId).toBe("conversation-1");
+      expect(task?.status).toBe("completed");
+    });
+  });
+
+  test("resumes a stored Deep Research task instead of resubmitting the prompt", async () => {
+    await withStore(async (store) => {
+      const created = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.markRunning(created.id);
+      store.upsertResearchTask(created.id, { taskId: "deepresch_resume", title: "Stored task" });
+
+      const result = await executeClaimedJob(store, store.get(created.id), testPaths(), {
+        runJob: async () => {
+          throw new Error("Prompt should not be resubmitted when a task id is stored.");
+        },
+        runResearchTask: async (task, options) => {
+          expect(task.taskId).toBe("deepresch_resume");
+          await options.onResearchTaskStatus?.({ ...task, status: "completed" });
+          return "resumed final report";
+        },
+      });
+
+      expect(result.result).toBe("resumed final report");
+      expect(store.get(created.id).status).toBe("succeeded");
+      expect(store.get(created.id).result).toBe("resumed final report");
+      expect(store.getResearchTask(created.id)?.status).toBe("completed");
+    });
+  });
+
+  test("defers transient polling failures without making the job terminal", async () => {
+    for (const code of ["NETWORK_ERROR", "CDP_TIMEOUT", "RESEARCH_WIDGET_UNAVAILABLE"] as const) {
+      await withStore(async (store) => {
+        const created = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+        store.markRunning(created.id);
+        store.upsertResearchTask(created.id, { taskId: "deepresch_resume" });
+
+        const result = await executeClaimedJob(store, store.get(created.id), testPaths(), {
+          runResearchTask: async () => {
+            throw new ProError(code, "transient polling failure");
+          },
+        });
+
+        expect(result.deferred).toBe(true);
+        expect(store.get(created.id).status).toBe("running");
+        const task = store.getResearchTask(created.id);
+        expect(task?.status).toBe("deferred");
+        expect(task?.nextPollAt).not.toBeNull();
+        expect(JSON.parse(task?.lastError as string).code).toBe(code);
+      });
+    }
+  });
+});
+
 describe("waitTimeoutError", () => {
   test("includes job, status, elapsedMs, timeoutMs, pollMs in details", () => {
     const error = waitTimeoutError({
@@ -308,3 +386,7 @@ describe("waitTimeoutError", () => {
     expect(error.message).toMatch(/2m(?!\s\d)/);
   });
 });
+
+function testPaths() {
+  return resolvePaths({ PRO_CLI_HOME: join(tmpdir(), "pro-executor-paths") });
+}

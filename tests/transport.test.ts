@@ -1,9 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import type { JobRecord } from "../src/jobs";
-import { runChatGptJob } from "../src/transport";
+import { runChatGptJob, runChatGptResearchTask } from "../src/transport";
 import { ProError } from "../src/errors";
 
 async function withTokenFile<T>(fn: (path: string) => Promise<T>): Promise<T> {
@@ -95,7 +95,7 @@ describe("ChatGPT transport", () => {
     });
   });
 
-  test("sends thinking_effort for Deep Research requests", async () => {
+  test("uses the Deep Research connector request shape", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       let expression = "";
       const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
@@ -110,8 +110,625 @@ describe("ChatGPT transport", () => {
 
       expect(result).toBe("OK");
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("research");
-      expect(requestBody.thinking_effort).toBe("extended");
+      expect(requestBody.model).toBe("gpt-5-5");
+      expect(requestBody).not.toHaveProperty("thinking_effort");
+      expect(requestBody.system_hints).toEqual(["connector:connector_openai_deep_research"]);
+      const messages = requestBody.messages as Array<{ metadata: Record<string, unknown> }>;
+      expect(messages[0].metadata).toMatchObject({
+        selected_sources: ["web"],
+        system_hints: ["connector:connector_openai_deep_research"],
+        deep_research_version: "standard",
+        venus_model_variant: "standard",
+      });
+    });
+  });
+
+  test("uses saved ChatGPT conversations for image generation and downloads image assets", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const artifactDir = await mkdtemp(join(tmpdir(), "pro-image-artifacts-"));
+      try {
+        const calls: string[] = [];
+        const tasks: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+          calls.push(expression);
+          if (expression.includes("/backend-api/conversation/")) {
+            return {
+              ok: true,
+              status: 200,
+              title: "Image generation request",
+              asyncStatus: 4,
+              assets: [
+                {
+                  fileId: "file_image_1",
+                  assetPointer: "sediment://file_image_1",
+                  width: 1024,
+                  height: 1024,
+                  sizeBytes: 9,
+                  title: "Blue paper boat",
+                  genId: "gen_image_1",
+                },
+              ],
+            } as T;
+          }
+          if (expression.includes("/backend-api/files/download/")) {
+            return {
+              ok: true,
+              status: 200,
+              contentType: "image/png",
+              bytes: 9,
+              base64: Buffer.from("png-bytes").toString("base64"),
+              fileName: "generated/boat.png",
+            } as T;
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: imageLaunchStream("conversation-image"),
+          } as T;
+        });
+
+        const result = await runChatGptJob(job({ model: "image", reasoning: "standard" }), {
+          sessionTokenPath,
+          pageEvaluator,
+          artifactDir,
+          onResearchTask: (task) => {
+            tasks.push(task.taskId);
+          },
+        });
+
+        const parsed = JSON.parse(result) as {
+          type: string;
+          conversationId: string;
+          images: Array<{ path: string; fileId: string; width: number; height: number; title: string }>;
+        };
+        expect(parsed.type).toBe("image_generation");
+        expect(parsed.conversationId).toBe("conversation-image");
+        expect(parsed.images).toHaveLength(1);
+        expect(parsed.images[0].fileId).toBe("file_image_1");
+        expect(parsed.images[0].width).toBe(1024);
+        expect(parsed.images[0].height).toBe(1024);
+        expect(parsed.images[0].title).toBe("Blue paper boat");
+        expect(await readFile(parsed.images[0].path, "utf8")).toBe("png-bytes");
+        expect(tasks).toEqual(["image:conversation-image"]);
+
+        const requestBody = requestBodyFromExpression(calls[0]);
+        expect(requestBody.model).toBe("gpt-5-5-pro");
+        expect(requestBody.history_and_training_disabled).toBeUndefined();
+        expect((requestBody.messages as Array<{ content: { parts: string[] } }>)[0].content.parts[0])
+          .toContain("Use ChatGPT image generation tools");
+      } finally {
+        await rm(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("resumes a persisted image task without submitting a new conversation", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const artifactDir = await mkdtemp(join(tmpdir(), "pro-image-resume-"));
+      try {
+        const calls: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+          calls.push(expression);
+          if (expression.includes("/backend-api/conversation/")) {
+            return {
+              ok: true,
+              status: 200,
+              title: "Resumed image",
+              asyncStatus: 4,
+              assets: [
+                {
+                  fileId: "file_resumed_image",
+                  assetPointer: "sediment://file_resumed_image",
+                  width: 512,
+                  height: 512,
+                  sizeBytes: 7,
+                  title: "Resumed image",
+                  genId: "gen_resumed",
+                },
+              ],
+            } as T;
+          }
+          if (expression.includes("/backend-api/files/download/")) {
+            return {
+              ok: true,
+              status: 200,
+              contentType: "image/png",
+              bytes: 7,
+              base64: Buffer.from("resume!").toString("base64"),
+              fileName: "resumed.png",
+            } as T;
+          }
+          throw new Error("Unexpected conversation submission.");
+        });
+
+        const result = await runChatGptResearchTask(
+          { taskId: "image:conversation-resume", conversationId: "conversation-resume", title: "Resumed image" },
+          { sessionTokenPath, pageEvaluator, artifactDir },
+        );
+
+        const parsed = JSON.parse(result) as { images: Array<{ path: string; fileId: string }> };
+        expect(parsed.images[0].fileId).toBe("file_resumed_image");
+        expect(await readFile(parsed.images[0].path, "utf8")).toBe("resume!");
+        expect(calls.some((call) => call.includes("/backend-api/f/conversation"))).toBe(false);
+      } finally {
+        await rm(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("rejects Deep Research acknowledgement-only responses as incomplete", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const acknowledgement = [
+        "Understood. I'll conduct a deep, price-blind analysis comparing Stripe's private/public valuation outlook versus American Express's public market cap by December 31, 2026.",
+        "",
+        "This includes:",
+        "- Stripe's likely valuation trajectory",
+        "- American Express's valuation drivers",
+        "- Resolution edge cases",
+        "",
+        "I'll return with a structured deep research report shortly.",
+      ].join("\n");
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({ ok: true, status: 200, body: conversationStream(acknowledgement) }) as T);
+
+      try {
+        await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+          sessionTokenPath,
+          pageEvaluator,
+        });
+        throw new Error("Expected INCOMPLETE_RESEARCH_ACK.");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ProError);
+        const proError = error as ProError;
+        expect(proError.code).toBe("INCOMPLETE_RESEARCH_ACK");
+        expect(proError.message).toContain("acknowledgement");
+        expect(proError.suggestions.join("\n")).toContain("gpt-5-5-pro");
+        expect(proError.details?.model).toBe("research");
+        expect(proError.details?.chars).toBe(acknowledgement.length);
+      }
+    });
+  });
+
+  test("returns completed Deep Research artifacts normally", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const report = [
+        "Executive summary",
+        "Stripe is the underdog but has a plausible right-tail path.",
+        "",
+        "Findings",
+        "1. Stripe private-market signals remain below AXP's current market cap.",
+        "2. AXP multiple compression is the main path for a Stripe win.",
+        "",
+        "Sources",
+        "- Nasdaq Private Market",
+        "- American Express investor relations",
+      ].join("\n");
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({ ok: true, status: 200, body: conversationStream(report) }) as T);
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+      });
+
+      expect(result).toBe(report);
+    });
+  });
+
+  test("polls Deep Research async tasks and returns the final task message", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let taskCalls = 0;
+      const launchedTasks: string[] = [];
+      const statuses: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        if (expression.includes("/backend-api/task/")) {
+          taskCalls += 1;
+          return {
+            ok: true,
+            status: 200,
+            body: {
+              status: "completed",
+              final_message: {
+                author: { role: "assistant" },
+                content: { content_type: "text", parts: ["Final Deep Research report."] },
+                status: "finished_successfully",
+              },
+            },
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: researchLaunchStream("deepresch_test", "I'll return with a structured deep research report shortly."),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+        onResearchTask: (task) => {
+          launchedTasks.push(task.taskId);
+        },
+        onResearchTaskStatus: (update) => {
+          statuses.push(update.status);
+        },
+      });
+
+      expect(result).toBe("Final Deep Research report.");
+      expect(taskCalls).toBe(1);
+      expect(launchedTasks).toEqual(["deepresch_test"]);
+      expect(statuses).toEqual(["completed"]);
+    });
+  });
+
+  test("polls Deep Research connector widget state and returns the final report", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const launchedTasks: string[] = [];
+      const statuses: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("/backend-api/conversation/")) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "completed",
+            title: "Connector research",
+            finalText: "Final connector report.",
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: deepResearchWidgetLaunchStream("conversation-widget", "widget-session-1"),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+        onResearchTask: (task) => {
+          launchedTasks.push(task.taskId);
+        },
+        onResearchTaskStatus: (update) => {
+          statuses.push(update.status);
+        },
+      });
+
+      expect(result).toBe("Final connector report.");
+      expect(launchedTasks).toEqual(["widget-session-1"]);
+      expect(statuses).toEqual(["completed"]);
+      expect(calls.some((call) => call.includes("/backend-api/conversation/"))).toBe(true);
+      expect(calls.some((call) => call.includes("/backend-api/task/"))).toBe(false);
+    });
+  });
+
+  test("polls Deep Research connector widgets when the launch stream has no assistant text", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const launchedTasks: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        if (expression.includes("/backend-api/conversation/")) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "completed",
+            title: "Connector research",
+            finalText: "Final report after metadata-only launch.",
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: deepResearchWidgetToolOnlyLaunchStream("conversation-widget", "widget-session-1"),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+        onResearchTask: (task) => {
+          launchedTasks.push(task.taskId);
+        },
+      });
+
+      expect(result).toBe("Final report after metadata-only launch.");
+      expect(launchedTasks).toEqual(["widget-session-1"]);
+    });
+  });
+
+  test("resumes polling a persisted Deep Research connector widget without submitting a new conversation", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const expressions: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        expressions.push(expression);
+        expect(expression).toContain("/backend-api/conversation/");
+        return {
+          ok: true,
+          status: 200,
+          statusText: "completed",
+          title: "Persisted connector research",
+          finalText: "Recovered connector report.",
+        } as T;
+      });
+
+      const result = await runChatGptResearchTask(
+        { taskId: "widget-session-2", title: "Persisted connector research", conversationId: "conversation-widget" },
+        { sessionTokenPath, pageEvaluator },
+      );
+
+      expect(result).toBe("Recovered connector report.");
+      expect(expressions).toHaveLength(1);
+      expect(expressions[0]).not.toContain("/backend-api/f/conversation");
+      expect(expressions[0]).not.toContain("/backend-api/task/");
+    });
+  });
+
+  test("continues Deep Research connector widget polling after a transient CDP timeout", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let attempts = 0;
+      const pageEvaluator = (async <T>(): Promise<T> => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new ProError("CDP_TIMEOUT", "Chrome CDP command Runtime.evaluate timed out.");
+        }
+        return {
+          ok: true,
+          status: 200,
+          statusText: "completed",
+          title: "Connector timeout recovery",
+          finalText: "Recovered connector report after CDP timeout.",
+        } as T;
+      });
+
+      const result = await runChatGptResearchTask(
+        { taskId: "widget-session-timeout", title: "Timeout recovery", conversationId: "conversation-widget" },
+        { sessionTokenPath, pageEvaluator, timeoutMs: 50 },
+      );
+
+      expect(result).toBe("Recovered connector report after CDP timeout.");
+      expect(attempts).toBe(2);
+    });
+  });
+
+  test("backs off and continues Deep Research connector widget polling after HTTP 429", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let attempts = 0;
+      const statuses: string[] = [];
+      const pageEvaluator = (async <T>(): Promise<T> => {
+        attempts += 1;
+        if (attempts === 1) {
+          return {
+            ok: false,
+            status: 429,
+            statusText: null,
+            title: null,
+            finalText: null,
+            preview: '{"detail":"Too many requests"}',
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          statusText: "completed",
+          title: "Connector rate-limit recovery",
+          finalText: "Recovered connector report after rate limit.",
+        } as T;
+      });
+
+      const result = await runChatGptResearchTask(
+        { taskId: "widget-session-rate-limited", title: "Rate-limit recovery", conversationId: "conversation-widget" },
+        {
+          sessionTokenPath,
+          pageEvaluator,
+          timeoutMs: 50,
+          onResearchTaskStatus: (update) => {
+            statuses.push(update.status);
+          },
+        },
+      );
+
+      expect(result).toBe("Recovered connector report after rate limit.");
+      expect(attempts).toBe(2);
+      expect(statuses).toEqual(["rate_limited", "completed"]);
+    });
+  });
+
+  test("resumes polling a persisted Deep Research async task without submitting a new conversation", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const expressions: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        expressions.push(expression);
+        expect(expression).toContain("/backend-api/task/");
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            status: "completed",
+            final_message: {
+              author: { role: "assistant" },
+              content: { content_type: "text", parts: ["Recovered final report."] },
+              status: "finished_successfully",
+            },
+          },
+        } as T;
+      });
+
+      const result = await runChatGptResearchTask(
+        { taskId: "deepresch_persisted", title: "Persisted research" },
+        { sessionTokenPath, pageEvaluator },
+      );
+
+      expect(result).toBe("Recovered final report.");
+      expect(expressions).toHaveLength(1);
+      expect(expressions[0]).not.toContain("/backend-api/f/conversation");
+    });
+  });
+
+  test("continues Deep Research polling after a transient CDP timeout", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let attempts = 0;
+      const pageEvaluator = (async <T>(): Promise<T> => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new ProError("CDP_TIMEOUT", "Chrome CDP command Runtime.evaluate timed out.");
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            status: "completed",
+            final_message: {
+              author: { role: "assistant" },
+              content: { content_type: "text", parts: ["Recovered after CDP timeout."] },
+              status: "finished_successfully",
+            },
+          },
+        } as T;
+      });
+
+      const result = await runChatGptResearchTask(
+        { taskId: "deepresch_timeout", title: "Timeout recovery" },
+        { sessionTokenPath, pageEvaluator, timeoutMs: 5 },
+      );
+
+      expect(result).toBe("Recovered after CDP timeout.");
+      expect(attempts).toBe(2);
+    });
+  });
+
+  test("recovers Deep Research task metadata from the saved conversation when the stream omits it", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("/backend-api/conversation/")) {
+          return {
+            ok: true,
+            status: 200,
+            task: {
+              taskId: "deepresch_from_conversation",
+              title: "Recovered research task",
+              conversationId: "async-conversation",
+            },
+          } as T;
+        }
+        if (expression.includes("/backend-api/task/")) {
+          return {
+            ok: true,
+            status: 200,
+            body: {
+              status: "completed",
+              final_message: {
+                author: { role: "assistant" },
+                content: { content_type: "text", parts: ["Recovered report."] },
+                status: "finished_successfully",
+              },
+            },
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: researchAckConversationStream("conversation-1", "I'll return with the report shortly."),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+      });
+
+      expect(result).toBe("Recovered report.");
+      expect(calls.some((call) => call.includes("/backend-api/conversation/"))).toBe(true);
+      expect(calls.some((call) => call.includes("/backend-api/task/"))).toBe(true);
+    });
+  });
+
+  test("recovers Deep Research task metadata when the acknowledgement is wrapped in research JSON", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const acknowledgementEnvelope = JSON.stringify({
+        task_violates_safety_guidelines: false,
+        user_def_doesnt_want_research: false,
+        response: "Understood. I'll begin deep research now and get back to you shortly.",
+        title: "Ceasefire research",
+        prompt: "Conduct a price-blind deep analysis.",
+      });
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("/backend-api/conversation/")) {
+          return {
+            ok: true,
+            status: 200,
+            task: {
+              taskId: "deepresch_json_envelope",
+              title: "Recovered JSON-envelope research task",
+            },
+          } as T;
+        }
+        if (expression.includes("/backend-api/task/")) {
+          return {
+            ok: true,
+            status: 200,
+            body: {
+              status: "completed",
+              final_message: {
+                author: { role: "assistant" },
+                content: { content_type: "text", parts: ["Recovered JSON-envelope report."] },
+                status: "finished_successfully",
+              },
+            },
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: researchAckConversationStream("conversation-2", acknowledgementEnvelope),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+        sessionTokenPath,
+        pageEvaluator,
+      });
+
+      expect(result).toBe("Recovered JSON-envelope report.");
+      expect(calls.some((call) => call.includes("/backend-api/conversation/"))).toBe(true);
+      expect(calls.some((call) => call.includes("/backend-api/task/"))).toBe(true);
+    });
+  });
+
+  test("keeps Deep Research async tasks non-successful while the task is still running", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        if (expression.includes("/backend-api/task/")) {
+          return {
+            ok: true,
+            status: 200,
+            body: { status: "running", task_id: "deepresch_test", final_message: null, messages: [] },
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: researchLaunchStream("deepresch_test", "I'll return with a structured deep research report shortly."),
+        } as T;
+      });
+
+      try {
+        await runChatGptJob(job({ model: "research", reasoning: "extended" }), {
+          sessionTokenPath,
+          pageEvaluator,
+          timeoutMs: 1,
+        });
+        throw new Error("Expected RESEARCH_TASK_INCOMPLETE.");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ProError);
+        const proError = error as ProError;
+        expect(proError.code).toBe("RESEARCH_TASK_INCOMPLETE");
+        expect(proError.details?.taskId).toBe("deepresch_test");
+        expect(proError.details?.status).toBe("running");
+      }
     });
   });
 
@@ -623,6 +1240,59 @@ function base64Url(value: string): string {
 function conversationStream(text: string): string {
   return [
     `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function researchLaunchStream(taskId: string, acknowledgement: string): string {
+  return [
+    `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(acknowledgement)}]},"status":"finished_successfully"}}`,
+    `data: {"v":{"message":{"author":{"role":"tool"},"content":{"content_type":"text","parts":[""]},"status":"finished_successfully","metadata":{"async_task_id":${JSON.stringify(taskId)},"async_task_title":"Research task","async_task_type":"research"}}}}`,
+    'data: {"type":"message_stream_complete"}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function deepResearchWidgetLaunchStream(conversationId: string, widgetSessionId: string): string {
+  const toolCall = JSON.stringify({
+    path: "/Deep Research App/implicit_link::connector_openai_deep_research/start",
+    args: { user_query: "Research this." },
+  });
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"message":{"author":{"role":"assistant"},"recipient":"api_tool.call_tool","content":{"content_type":"text","parts":[${JSON.stringify(toolCall)}]},"status":"finished_successfully"}}`,
+    `data: {"v":{"message":{"author":{"role":"tool","name":"api_tool.call_tool"},"content":{"content_type":"code","text":"{}"},"status":"finished_successfully","metadata":{"chatgpt_sdk":{"widget_session_id":${JSON.stringify(widgetSessionId)},"resolved_pineapple_uri":"connectors://connector_openai_deep_research","attribution_id":"connector_openai_deep_research","widget_state":${JSON.stringify(JSON.stringify({ status: "waiting_for_user_response_on_plan", plan: { title: "Connector research" } }))}}}}}}`,
+    'data: {"type":"message_stream_complete"}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function deepResearchWidgetToolOnlyLaunchStream(conversationId: string, widgetSessionId: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)}}`,
+    `data: {"v":{"message":{"author":{"role":"tool","name":"api_tool.call_tool"},"content":{"content_type":"code","text":"{}"},"status":"finished_successfully","metadata":{"chatgpt_sdk":{"widget_session_id":${JSON.stringify(widgetSessionId)},"resolved_pineapple_uri":"connectors://connector_openai_deep_research","attribution_id":"connector_openai_deep_research","widget_state":${JSON.stringify(JSON.stringify({ status: "waiting_for_user_response_on_plan", plan: { title: "Connector research" } }))}}}}}}`,
+    'data: {"type":"message_stream_complete"}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function researchAckConversationStream(conversationId: string, acknowledgement: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(acknowledgement)}]},"status":"finished_successfully"}}`,
+    'data: {"type":"message_stream_complete"}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function imageLaunchStream(conversationId: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"message":{"author":{"role":"tool","name":"image_gen"},"content":{"content_type":"multimodal_text","parts":[]},"status":"finished_successfully","metadata":{"ghostrider":{"status":"intermediate"}}}}`,
+    `data: {"type":"server_ste_metadata","metadata":{"turn_use_case":"image gen"},"conversation_id":${JSON.stringify(conversationId)}}`,
+    `data: {"type":"message_stream_complete","conversation_id":${JSON.stringify(conversationId)}}`,
     "data: [DONE]",
     "",
   ].join("\n\n");

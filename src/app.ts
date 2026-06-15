@@ -14,7 +14,13 @@ import {
   showProCliChromeWindow,
 } from "./auth";
 import { loadConfig, migrateLegacyDefaultHome, resolvePaths, saveConfig } from "./config";
-import { ensureDaemonRunning, getDaemonStatus, runDaemonServer, stopDaemon } from "./daemon";
+import {
+  ensureDaemonRunning,
+  getDaemonStatus,
+  runDaemonServer,
+  stopDaemon,
+  type DaemonClient,
+} from "./daemon";
 import { DEFAULT_MODEL, DEFAULT_REASONING, REASONING_LEVELS, isReasoningLevel } from "./defaults";
 import { EXIT, ProError, toProError } from "./errors";
 import { buildEphemeralJob, executeEphemeralJob } from "./executor";
@@ -34,7 +40,10 @@ import { writeError, writeSuccess } from "./output";
 import { updateProCli } from "./update";
 
 const HELP_TEXT =
-  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nupdate: fast-forward install\nUse --json for agents.";
+  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nupdate: fast-forward install\nTimeouts: --timeout is the ChatGPT/research task window; Deep Research defaults to 1800000ms (30m) and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting; omit them to wait until terminal.\nUse --json for agents.";
+const DEFAULT_RESEARCH_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_IMAGE_TIMEOUT_MS = 10 * 60_000;
+const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
 
 export async function runCli(argv: string[], io: CliIO): Promise<number> {
   const parsed = parseArgs(argv);
@@ -164,6 +173,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
         const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
         applyModelConversationRequirements(askOptions, parsed.flags, askModel);
+        applyModelTimeoutDefaults(askOptions, parsed.flags, askModel);
         const schemaRaw = flagString(parsed.flags, "schema");
         const formatHint = flagString(parsed.flags, "format");
         if (schemaRaw && formatHint) {
@@ -236,6 +246,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         );
         const oddsModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
         applyModelConversationRequirements(baseRequestOptions, parsed.flags, oddsModel);
+        applyModelTimeoutDefaults(baseRequestOptions, parsed.flags, oddsModel);
         const result = await runOdds({
           question,
           context,
@@ -294,6 +305,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
           const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
           applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
+          applyModelTimeoutDefaults(jobOptions, parsed.flags, jobModel);
           const input = {
             prompt: userPrompt,
             model: jobModel,
@@ -315,19 +327,15 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
                   const created = await daemon.client.createJob({ ...input, prompt: wrappedPrompt });
                   const jobId = jobIdFromPayload(created);
                   jobIds.push(jobId);
-                  const waited = await daemon.client.wait(
-                    jobId,
-                    waitOptions.timeoutMs,
-                    waitOptions.pollMs,
-                    waitOptions.softTimeout,
-                  );
+                  const waitResult = await waitForDaemonJob(paths, io, daemon.client, jobId, waitOptions);
+                  const waited = waitResult.payload;
                   if (!isRecord(waited.job) || waited.job.status !== "succeeded") {
                     throw new ProError("STRUCTURED_RUNNER_FAILED", "Job did not reach succeeded status.", {
                       exitCode: EXIT.upstream,
                       details: { jobId, waited },
                     });
                   }
-                  const fetched = await daemon.client.result(jobId);
+                  const fetched = await waitResult.client.result(jobId);
                   return typeof fetched.result === "string" ? fetched.result : "";
                 },
               });
@@ -344,16 +352,12 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             if (waitRequested) {
               const waitOptions = parseWaitOptions(parsed.flags);
               const jobId = jobIdFromPayload(created);
-              const waited = await daemon.client.wait(
-                jobId,
-                waitOptions.timeoutMs,
-                waitOptions.pollMs,
-                waitOptions.softTimeout,
-              );
+              const waitResult = await waitForDaemonJob(paths, io, daemon.client, jobId, waitOptions);
+              const waited = waitResult.payload;
               throwIfTerminalJobFailure(waited, jobId);
               writeSuccess(io, mode, {
                 ...waited,
-                ...(await resultIfSucceeded(daemon.client, jobId, waited)),
+                ...(await resultIfSucceeded(waitResult.client, jobId, waited)),
                 daemon: { started: daemon.started, status: daemon.status },
               });
               return EXIT.success;
@@ -407,12 +411,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           if (!jobId) throw invalidArgs("Missing job id.", ["Use pro-cli job wait <job-id>."]);
           const waitOptions = parseWaitOptions(parsed.flags);
           const daemon = await ensureDaemonRunning(paths, io);
-          const waited = await daemon.client.wait(
-            jobId,
-            waitOptions.timeoutMs,
-            waitOptions.pollMs,
-            waitOptions.softTimeout,
-          );
+          const waitResult = await waitForDaemonJob(paths, io, daemon.client, jobId, waitOptions);
+          const waited = waitResult.payload;
           throwIfTerminalJobFailure(waited, jobId);
           writeSuccess(io, mode, waited);
           return EXIT.success;
@@ -712,7 +712,7 @@ async function collectRequestOptions(
     "none",
   ]);
   setStringOption(options, "toolChoice", flags, "tool-choice", ["auto", "none", "required"]);
-  setIntegerOption(options, "timeoutMs", flags, "timeout", 1, 30 * 60_000);
+  setIntegerOption(options, "timeoutMs", flags, "timeout", 1, MAX_REQUEST_TIMEOUT_MS);
   setIntegerOption(options, "retries", flags, "retries", 0, 5);
   setIntegerOption(options, "retryDelayMs", flags, "retry-delay", 0, 60_000);
   setIntegerAliasOption(
@@ -870,21 +870,49 @@ function applyModelConversationRequirements(
   model: string,
 ): void {
   if (!modelRequiresSavedConversation(model)) return;
+  const label = canonicalModelId(model) === "image" ? "Image generation" : "Deep Research";
   const store = readBooleanFlag(flags, "store");
   const requestedTemporary = flagBoolean(flags, "temporary") || store === false;
   if (requestedTemporary) {
-    throw invalidArgs("Deep Research does not support temporary chats.", [
-      "Remove --temporary or --store false; pro-cli uses a saved ChatGPT conversation for --model research.",
+    throw invalidArgs(`${label} does not support temporary chats.`, [
+      `Remove --temporary or --store false; pro-cli uses a saved ChatGPT conversation for --model ${canonicalModelId(model)}.`,
     ]);
   }
   if (!options.conversationId) options.temporary = false;
+}
+
+function applyModelTimeoutDefaults(
+  options: Record<string, unknown>,
+  flags: Map<string, string | boolean | string[]>,
+  model: string,
+): void {
+  const canonical = canonicalModelId(model);
+  if (canonical !== "research" && canonical !== "image") return;
+  const explicitTimeout = flagString(flags, "timeout");
+  if (canonical === "image") {
+    if (explicitTimeout === undefined) {
+      options.timeoutMs = DEFAULT_IMAGE_TIMEOUT_MS;
+      return;
+    }
+    return;
+  }
+  if (explicitTimeout === undefined) {
+    options.timeoutMs = DEFAULT_RESEARCH_TIMEOUT_MS;
+    return;
+  }
+  if (typeof options.timeoutMs === "number" && options.timeoutMs >= DEFAULT_RESEARCH_TIMEOUT_MS) return;
+  throw invalidArgs("Deep Research --timeout must be at least 1800000ms (30 minutes).", [
+    "Omit --timeout to use the 30-minute Deep Research default.",
+    "Use --timeout 1800000 or larger for Deep Research.",
+    "Use --wait-timeout only to limit how long the local terminal waits; it does not stop the remote research task.",
+  ]);
 }
 
 function resolveModel(model: string): string {
   const value = canonicalModelId(model);
   if (!value || value === "auto") {
     throw invalidArgs("Invalid --model.", [
-      "Use a concrete model id such as gpt-5-5-pro, gpt-4-5, or research; or run pro-cli models --json.",
+      "Use a concrete model id such as gpt-5-5-pro, gpt-4-5, research, or image; or run pro-cli models --json.",
     ]);
   }
   return value;
@@ -1030,6 +1058,38 @@ function hasWaitOptionFlags(flags: Map<string, string | boolean | string[]>): bo
   );
 }
 
+async function waitForDaemonJob(
+  paths: ReturnType<typeof resolvePaths>,
+  io: CliIO,
+  initialClient: DaemonClient,
+  jobId: string,
+  options: WaitOptions,
+): Promise<{ payload: Record<string, unknown>; client: DaemonClient }> {
+  const startedAt = Date.now();
+  let client = initialClient;
+  while (true) {
+    const timeoutMs = remainingWaitTimeout(options.timeoutMs, startedAt);
+    try {
+      const payload = await client.wait(jobId, timeoutMs, options.pollMs, options.softTimeout);
+      return { payload, client };
+    } catch (error) {
+      if (!isDaemonUnavailable(error)) throw error;
+      if (options.timeoutMs > 0 && Date.now() - startedAt >= options.timeoutMs) throw error;
+      await sleep(100);
+      client = (await ensureDaemonRunning(paths, io)).client;
+    }
+  }
+}
+
+function remainingWaitTimeout(timeoutMs: number, startedAt: number): number {
+  if (timeoutMs === 0) return 0;
+  return Math.max(1, timeoutMs - (Date.now() - startedAt));
+}
+
+function isDaemonUnavailable(error: unknown): boolean {
+  return error instanceof ProError && error.code === "DAEMON_UNAVAILABLE";
+}
+
 function jobIdFromPayload(payload: Record<string, unknown>): string {
   const job = payload.job;
   if (isRecord(job) && typeof job.id === "string") return job.id;
@@ -1162,6 +1222,10 @@ function redactPaths(paths: { home: string; configPath: string; dbPath: string }
     configPath: paths.configPath,
     dbPath: paths.dbPath,
   };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function shellQuote(value: string): string {

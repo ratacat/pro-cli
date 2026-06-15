@@ -255,6 +255,46 @@ describe("job store: claim semantics", () => {
       expect(store.claimNextQueued()).toBeNull();
     });
   });
+
+  test("claimNextRunnable resumes a running job with a stored research task", async () => {
+    await withStore(async (store) => {
+      const running = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.markRunning(running.id);
+      store.upsertResearchTask(running.id, { taskId: "deepresch_resume", title: "Research task" });
+
+      const runnable = store.claimNextRunnable();
+
+      expect(runnable?.id).toBe(running.id);
+      expect(runnable?.status).toBe("running");
+    });
+  });
+
+  test("claimNextRunnable prefers queued jobs over resumable research tasks", async () => {
+    await withStore(async (store) => {
+      const running = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.markRunning(running.id);
+      store.upsertResearchTask(running.id, { taskId: "deepresch_resume" });
+      await wait(2);
+      const queued = store.create({ prompt: "new", model: "gpt-5-5-pro", reasoning: "standard", options: {} });
+
+      const runnable = store.claimNextRunnable();
+
+      expect(runnable?.id).toBe(queued.id);
+      expect(runnable?.status).toBe("running");
+      expect(store.get(running.id).status).toBe("running");
+    });
+  });
+
+  test("claimNextRunnable skips deferred research tasks until nextPollAt", async () => {
+    await withStore(async (store) => {
+      const running = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.markRunning(running.id);
+      store.upsertResearchTask(running.id, { taskId: "deepresch_resume" });
+      store.deferResearchTask(running.id, new ProError("NETWORK_ERROR", "offline"), 60_000);
+
+      expect(store.claimNextRunnable()).toBeNull();
+    });
+  });
 });
 
 describe("job store: limits observations", () => {
@@ -327,6 +367,41 @@ describe("job store: persistence", () => {
         expect(job.status).toBe("succeeded");
         expect(job.result).toBe("result body");
         expect(job.prompt).toBe("p");
+      } finally {
+        second.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("research task metadata survives close + reopen", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pro-jobs-research-task-"));
+    const path = join(dir, "jobs.sqlite");
+    let id = "";
+    try {
+      const first = await JobStore.open(path);
+      try {
+        const created = first.create({ prompt: "p", model: "research", reasoning: "extended", options: {} });
+        first.markRunning(created.id);
+        first.upsertResearchTask(created.id, {
+          taskId: "deepresch_persist",
+          title: "Persistent research",
+          conversationId: "conversation-1",
+        });
+        first.updateResearchTaskStatus(created.id, "running");
+        id = created.id;
+      } finally {
+        first.close();
+      }
+
+      const second = await JobStore.open(path);
+      try {
+        const task = second.getResearchTask(id);
+        expect(task?.taskId).toBe("deepresch_persist");
+        expect(task?.title).toBe("Persistent research");
+        expect(task?.conversationId).toBe("conversation-1");
+        expect(task?.status).toBe("running");
       } finally {
         second.close();
       }

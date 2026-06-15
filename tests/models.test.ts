@@ -47,6 +47,13 @@ describe("model discovery", () => {
       reasoningType: "pro",
       configurableThinkingEffort: true,
     });
+    expect(result.models.find((model) => model.id === "image")).toMatchObject({
+      label: "Image Generation",
+      reasoningLevels: ["standard", "extended"],
+      reasoningType: "pro",
+      configurableThinkingEffort: true,
+      enabledTools: ["image_gen_tool_enabled"],
+    });
   });
 
   test("loads live ChatGPT model catalog with bearer auth", async () => {
@@ -93,6 +100,7 @@ describe("model discovery", () => {
         reasoningLevels: ["standard", "extended"],
         enabledTools: ["python", "web"],
       });
+      expect(result.models.map((model) => model.id)).toContain("image");
     });
   });
 
@@ -128,7 +136,7 @@ describe("model discovery", () => {
 
       const result = await listModels({ sessionTokenPath });
       expect(result.source).toBe("live");
-      expect(result.models.map((model) => model.id)).toEqual(["gpt-5-5-pro"]);
+      expect(result.models.map((model) => model.id)).toEqual(["gpt-5-5-pro", "image"]);
     });
   });
 
