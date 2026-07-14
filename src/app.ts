@@ -40,7 +40,7 @@ import { writeError, writeSuccess } from "./output";
 import { updateProCli } from "./update";
 
 const HELP_TEXT =
-  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nupdate: fast-forward install\nTimeouts: --timeout is the ChatGPT/research task window; Deep Research defaults to 1800000ms (30m) and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting; omit them to wait until terminal.\nUse --json for agents.";
+  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nupdate: fast-forward install\nImages: pass --model image to ask or job create; requires a saved (non-temporary) conversation; result JSON lists generated files saved under ~/.pro-cli/images/<jobId>/; default --timeout 600000ms (10m).\nTimeouts: --timeout is the ChatGPT/research task window; Deep Research defaults to 1800000ms (30m) and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting; omit them to wait until terminal.\nUse --json for agents.";
 const DEFAULT_RESEARCH_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 10 * 60_000;
 const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;

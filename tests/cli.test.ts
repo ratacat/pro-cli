@@ -59,7 +59,8 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("update: fast-forward install");
     expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
     expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
-    expect(result.stdout.length).toBeLessThan(520);
+    expect(result.stdout).toContain("Images: pass --model image");
+    expect(result.stdout.length).toBeLessThan(700);
     expect(result.stderr).toBe("");
   });
 
@@ -74,7 +75,8 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("update: fast-forward install");
     expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
     expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
-    expect(result.stdout.length).toBeLessThan(520);
+    expect(result.stdout).toContain("Images: pass --model image");
+    expect(result.stdout.length).toBeLessThan(700);
     expect(result.stderr).toBe("");
   });
 
