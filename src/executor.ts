@@ -32,6 +32,8 @@ export async function executeClaimedJob(
       retries: numberFromOption(job.options.retries),
       retryDelayMs: numberFromOption(job.options.retryDelayMs),
       artifactDir: join(paths.home, "images", job.id),
+      keepImageConversation:
+        job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),
       onResearchTask: (task) => {
         store.upsertResearchTask(job.id, task);
@@ -113,6 +115,8 @@ export async function executeEphemeralJob(
       retries: numberFromOption(job.options.retries),
       retryDelayMs: numberFromOption(job.options.retryDelayMs),
       artifactDir: join(paths.home, "images", job.id),
+      keepImageConversation:
+        job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),
     });
     if (observations.length > 0) await persistLimits(paths.dbPath, observations, job.id);

@@ -1,7 +1,7 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { basename, isAbsolute, join } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
-import { flagBoolean, flagString, parseArgs } from "./args";
+import { flagBoolean, flagString, flagStrings, parseArgs } from "./args";
 import {
   captureAuth,
   defaultCdpBase,
@@ -14,6 +14,11 @@ import {
   showProCliChromeWindow,
 } from "./auth";
 import { loadConfig, migrateLegacyDefaultHome, resolvePaths, saveConfig } from "./config";
+import {
+  archiveConversations,
+  deleteConversations,
+  listConversations,
+} from "./conversations";
 import {
   ensureDaemonRunning,
   getDaemonStatus,
@@ -31,6 +36,7 @@ import {
   listModels,
   modelRequiresSavedConversation,
   modelUsesThinkingEffort,
+  reasoningLevelsForModel,
   NO_REASONING,
 } from "./models";
 import { runOdds, type AggregateMethod } from "./odds";
@@ -40,7 +46,7 @@ import { writeError, writeSuccess } from "./output";
 import { updateProCli } from "./update";
 
 const HELP_TEXT =
-  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nupdate: fast-forward install\nImages: pass --model image to ask or job create; requires a saved (non-temporary) conversation; result JSON lists generated files saved under ~/.pro-cli/images/<jobId>/; default --timeout 600000ms (10m).\nTimeouts: --timeout is the ChatGPT/research task window; Deep Research defaults to 1800000ms (30m) and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting; omit them to wait until terminal.\nUse --json for agents.";
+  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nconversations list|archive|delete: clean saved chats\nupdate: fast-forward install\nImages: --model image on ask/job create; saved conversation, auto-deleted after download unless --keep-conversation; edit via --attach <image>; files: ~/.pro-cli/images/<jobId>/.\nTimeouts: Deep Research defaults to 1800000ms and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting.\nUse --json for agents.";
 const DEFAULT_RESEARCH_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 10 * 60_000;
 const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
@@ -166,6 +172,44 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         } finally {
           store.close();
         }
+      }
+      case "conversations": {
+        if (subcommand === "list") {
+          const limit = parseIntegerFlag(parsed.flags, "limit", 28, 1, 100);
+          const offset = parseIntegerFlag(parsed.flags, "offset", 0, 0, 10_000);
+          const result = await listConversations({
+            sessionTokenPath: paths.sessionTokenPath,
+            limit,
+            offset,
+          });
+          writeSuccess(io, mode, result);
+          return EXIT.success;
+        }
+        if (subcommand === "archive" || subcommand === "delete") {
+          const conversationIds = rest.filter(Boolean);
+          if (conversationIds.length === 0) {
+            throw invalidArgs(`Pass at least one conversation id to ${subcommand}.`, [
+              `Use pro-cli conversations ${subcommand} <conversation-id> [...more-ids] --json.`,
+              "Find ids with pro-cli conversations list --json.",
+            ]);
+          }
+          const outcomes =
+            subcommand === "archive"
+              ? await archiveConversations({ sessionTokenPath: paths.sessionTokenPath, conversationIds })
+              : await deleteConversations({ sessionTokenPath: paths.sessionTokenPath, conversationIds });
+          const failed = outcomes.filter((outcome) => !outcome.ok);
+          writeSuccess(io, mode, {
+            action: subcommand,
+            requested: conversationIds.length,
+            succeeded: outcomes.length - failed.length,
+            failed: failed.length,
+            outcomes,
+          });
+          return failed.length === 0 ? EXIT.success : EXIT.upstream;
+        }
+        throw invalidArgs("Unknown conversations command.", [
+          "Use pro-cli conversations list, pro-cli conversations archive <id...>, or pro-cli conversations delete <id...>.",
+        ]);
       }
       case "ask": {
         const prompt = await promptFromArgs([subcommand, ...rest].filter(Boolean), io.cwd);
@@ -564,6 +608,9 @@ function commandList(): string[] {
     "ask",
     "odds",
     "limits",
+    "conversations list",
+    "conversations archive",
+    "conversations delete",
     "job create",
     "job status",
     "job wait",
@@ -726,6 +773,11 @@ async function collectRequestOptions(
   );
   setBooleanOption(options, "parallelTools", flags, "parallel-tools");
   setConversationOptions(options, flags);
+  if (flagBoolean(flags, "keep-conversation")) options.keepConversation = true;
+  const attachPaths = flagStrings(flags, "attach");
+  if (attachPaths.length > 0) {
+    options.attachments = await resolveAttachments(attachPaths, cwd);
+  }
   const cdp = flagString(flags, "cdp");
   const port = flagString(flags, "port");
   if (cdp || port) options.cdpBase = defaultCdpBase(port, cdp);
@@ -742,6 +794,39 @@ async function collectRequestOptions(
     options.instructions = await readFile(new URL(instructionsFile, `file://${cwd}/`), "utf8");
   }
   return options;
+}
+
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+
+async function resolveAttachments(
+  paths: string[],
+  cwd: string,
+): Promise<Array<{ path: string; name: string; mimeType: string }>> {
+  const attachments: Array<{ path: string; name: string; mimeType: string }> = [];
+  for (const rawPath of paths) {
+    const absolute = isAbsolute(rawPath) ? rawPath : join(cwd, rawPath);
+    const extension = absolute.split(".").pop()?.toLowerCase() ?? "";
+    const mimeType = IMAGE_MIME_BY_EXTENSION[extension];
+    if (!mimeType) {
+      throw invalidArgs(`Unsupported attachment type: ${rawPath}.`, [
+        `--attach accepts image files (${Object.keys(IMAGE_MIME_BY_EXTENSION).join(", ")}).`,
+      ]);
+    }
+    const stats = await stat(absolute).catch(() => null);
+    if (!stats?.isFile()) {
+      throw invalidArgs(`Attachment not found: ${rawPath}.`, [
+        "Pass --attach with an existing image file path.",
+      ]);
+    }
+    attachments.push({ path: absolute, name: basename(absolute), mimeType });
+  }
+  return attachments;
 }
 
 const ASK_REQUEST_FLAGS = new Set([
@@ -766,6 +851,8 @@ const ASK_REQUEST_FLAGS = new Set([
   "no-temporary",
   "conversation",
   "parent",
+  "attach",
+  "keep-conversation",
   "cdp",
   "port",
   "schema",
@@ -861,7 +948,21 @@ function resolveRequestReasoning(
     }
     return NO_REASONING;
   }
-  return resolveReasoning(explicitReasoning ?? configuredReasoning ?? DEFAULT_REASONING);
+  const resolved = resolveReasoning(explicitReasoning ?? configuredReasoning ?? DEFAULT_REASONING);
+  const supportedLevels = reasoningLevelsForModel(model);
+  if (supportedLevels && supportedLevels.length > 0 && !supportedLevels.includes(resolved)) {
+    const canonical = canonicalModelId(model);
+    if (explicitReasoning !== undefined) {
+      throw invalidArgs(`Model ${canonical} does not support --reasoning ${resolved}.`, [
+        `ChatGPT's catalog exposes ${supportedLevels.join(", ")} for ${canonical}.`,
+        ...(resolved === "extended"
+          ? ["Use --model gpt-5-5-pro --reasoning extended for Extended Pro reasoning."]
+          : []),
+      ]);
+    }
+    return supportedLevels.includes(DEFAULT_REASONING) ? DEFAULT_REASONING : (supportedLevels[0] as string);
+  }
+  return resolved;
 }
 
 function applyModelConversationRequirements(

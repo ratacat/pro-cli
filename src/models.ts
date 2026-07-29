@@ -38,34 +38,57 @@ interface LiveModel {
   enabled_tools?: unknown;
 }
 
-const MODEL_ID_ALIASES = new Map<string, string>([
-  ["4.5", "gpt-4-5"],
-  ["gpt 4.5", "gpt-4-5"],
-  ["gpt-4.5", "gpt-4-5"],
-  ["deep research", "research"],
-  ["deep-research", "research"],
-  ["deep_research", "research"],
-  ["images", "image"],
-  ["image generation", "image"],
-  ["image-generation", "image"],
-  ["image_generation", "image"],
-]);
+const MODEL_ID_ALIASES: Record<string, string> = {
+  "4.5": "gpt-4-5",
+  "gpt 4.5": "gpt-4-5",
+  "gpt-4.5": "gpt-4-5",
+  "5.5-pro": "gpt-5-5-pro",
+  "gpt-5.5-pro": "gpt-5-5-pro",
+  "gpt 5.5 pro": "gpt-5-5-pro",
+  "5.6-pro": "gpt-5-6-pro",
+  "gpt-5.6-pro": "gpt-5-6-pro",
+  "gpt 5.6 pro": "gpt-5-6-pro",
+  "pro": "gpt-5-6-pro",
+  "5.6-thinking": "gpt-5-6-thinking",
+  "gpt-5.6-thinking": "gpt-5-6-thinking",
+  "gpt 5.6 thinking": "gpt-5-6-thinking",
+  "sol": "gpt-5.6-sol-wm",
+  "gpt-5.6-sol": "gpt-5.6-sol-wm",
+  "terra": "gpt-5.6-terra-wm",
+  "gpt-5.6-terra": "gpt-5.6-terra-wm",
+  "luna": "gpt-5.6-luna-wm",
+  "gpt-5.6-luna": "gpt-5.6-luna-wm",
+  "deep research": "research",
+  "deep-research": "research",
+  "deep_research": "research",
+  "images": "image",
+  "image generation": "image",
+  "image-generation": "image",
+  "image_generation": "image",
+};
 
 const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
+  {
+    id: "gpt-5-6-pro",
+    label: "GPT-5.6 Pro",
+    source: "static-unverified",
+    reasoningLevels: ["standard"],
+    default: true,
+    reasoningType: "pro",
+  },
   {
     id: "gpt-5-5-pro",
     label: "GPT-5.5 Pro",
     source: "static-unverified",
     reasoningLevels: ["standard", "extended"],
-    default: true,
     reasoningType: "pro",
   },
   {
-    id: "gpt-5-4-pro",
-    label: "GPT-5.4 Pro",
+    id: "gpt-5-6-thinking",
+    label: "GPT-5.6 Thinking",
     source: "static-unverified",
-    reasoningLevels: ["standard", "extended"],
-    reasoningType: "pro",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
   },
   {
     id: "gpt-5-5-thinking",
@@ -106,12 +129,17 @@ export const NO_REASONING = "none";
 
 export function canonicalModelId(model: string): string {
   const trimmed = model.trim();
-  return MODEL_ID_ALIASES.get(trimmed.toLowerCase()) ?? trimmed;
+  return MODEL_ID_ALIASES[trimmed.toLowerCase()] ?? trimmed;
 }
 
 export function modelUsesThinkingEffort(model: string): boolean {
   const capability = STATIC_MODEL_BY_ID.get(canonicalModelId(model));
   return capability?.reasoningType !== "none";
+}
+
+export function reasoningLevelsForModel(model: string): string[] | undefined {
+  const capability = STATIC_MODEL_BY_ID.get(canonicalModelId(model));
+  return capability ? [...capability.reasoningLevels] : undefined;
 }
 
 export function modelRequiresSavedConversation(model: string): boolean {

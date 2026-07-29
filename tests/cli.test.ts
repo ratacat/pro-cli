@@ -59,7 +59,8 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("update: fast-forward install");
     expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
     expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
-    expect(result.stdout).toContain("Images: pass --model image");
+    expect(result.stdout).toContain("Images: --model image");
+    expect(result.stdout).toContain("conversations list|archive|delete");
     expect(result.stdout.length).toBeLessThan(700);
     expect(result.stderr).toBe("");
   });
@@ -75,7 +76,8 @@ describe("robot-mode CLI", () => {
     expect(result.stdout).toContain("update: fast-forward install");
     expect(result.stdout).toContain("Deep Research defaults to 1800000ms");
     expect(result.stdout).toContain("--wait-timeout/--soft-timeout only control local daemon waiting");
-    expect(result.stdout).toContain("Images: pass --model image");
+    expect(result.stdout).toContain("Images: --model image");
+    expect(result.stdout).toContain("conversations list|archive|delete");
     expect(result.stdout.length).toBeLessThan(700);
     expect(result.stderr).toBe("");
   });
@@ -224,7 +226,7 @@ describe("robot-mode CLI", () => {
       const created = JSON.parse(createdResult.stdout);
       const jobId = created.data.job.id;
       expect(created.data.job.status).toBe("queued");
-      expect(created.data.job.model).toBe("gpt-5-5-pro");
+      expect(created.data.job.model).toBe("gpt-5-6-pro");
       expect(created.data.job.reasoning).toBe("standard");
       expect(created.data.daemon.started).toBe(false);
       expect(created.data.job.prompt).toBe("");
@@ -336,6 +338,8 @@ describe("robot-mode CLI", () => {
           "ask",
           "hello",
           "--json",
+          "--model",
+          "gpt-5-5-pro",
           "--reasoning",
           "extended",
           "--verbosity",
@@ -371,6 +375,45 @@ describe("robot-mode CLI", () => {
       expect(requestBody.verbosity).toBe("low");
       expect(requestBody.history_and_training_disabled).toBe(true);
       expect(requestBody).not.toHaveProperty("text");
+    });
+  });
+
+  test("rejects explicit reasoning levels the model catalog does not list", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      installFakeCdp(conversationStream("OK"), () => {});
+
+      const result = await run(
+        ["ask", "hello", "--model", "gpt-5-6-pro", "--reasoning", "extended", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).not.toBe(0);
+      const payload = JSON.parse(result.stderr);
+      expect(payload.error.code).toBe("INVALID_ARGS");
+      expect(payload.error.message).toContain("does not support --reasoning extended");
+      expect(JSON.stringify(payload.error.suggestions)).toContain("gpt-5-5-pro");
+    });
+  });
+
+  test("clamps configured reasoning to a level the model supports", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      await writeFile(
+        join(home, "config.json"),
+        JSON.stringify({ defaultReasoning: "extended" }),
+      );
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => {
+        expression = script;
+      });
+
+      const result = await run(["ask", "hello", "--json"], { tty: true, home });
+
+      expect(result.code).toBe(0);
+      const requestBody = requestBodyFromExpression(expression);
+      expect(requestBody.model).toBe("gpt-5-6-pro");
+      expect(requestBody.thinking_effort).toBe("standard");
     });
   });
 
@@ -425,7 +468,7 @@ describe("robot-mode CLI", () => {
 
       expect(result.code).toBe(0);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("gpt-5-5-pro");
+      expect(requestBody.model).toBe("gpt-5-6-pro");
       expect(requestBody.thinking_effort).toBe("standard");
     });
   });
@@ -637,6 +680,8 @@ describe("robot-mode CLI", () => {
           "conv_123",
           "--parent",
           "msg_456",
+          "--model",
+          "gpt-5-5-pro",
           "--reasoning",
           "extended",
         ],

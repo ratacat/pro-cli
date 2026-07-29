@@ -1,4 +1,4 @@
-export const DEFAULT_MODEL = "gpt-5-5-pro";
+export const DEFAULT_MODEL = "gpt-5-6-pro";
 export const DEFAULT_REASONING = "standard";
 export const REASONING_LEVELS = ["min", "standard", "extended", "max"] as const;
 

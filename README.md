@@ -116,7 +116,7 @@ Models and defaults:
 ```sh
 pro-cli models --json
 pro-cli config get --json
-pro-cli config set model gpt-5-5-pro --json
+pro-cli config set model gpt-5-6-pro --json
 pro-cli config set reasoning extended --json
 ```
 
@@ -168,7 +168,9 @@ pro-cli job create "Create one square flat vector icon of a blue paper boat on w
   --model image --wait --json
 ```
 
-Image generation is async and uses a saved ChatGPT conversation. Temporary chats cannot create images in ChatGPT, so `--model image` rejects `--temporary` and `--store false`.
+Image generation is async and uses a saved ChatGPT conversation. Temporary chats cannot create images in ChatGPT (re-verified 2026-07-29: the model reports the image tool is unavailable in temporary chats), so `--model image` rejects `--temporary` and `--store false`.
+
+To keep ChatGPT history clean, pro-cli deletes the saved conversation right after downloading the generated files and reports `conversationDeleted` in the result JSON. Pass `--keep-conversation` to leave it in ChatGPT history; continuing an existing conversation with `--conversation` also keeps it.
 
 Generated files are downloaded to:
 
@@ -176,13 +178,24 @@ Generated files are downloaded to:
 ~/.pro-cli/images/<job-id>/image-1.png
 ```
 
-The job result is a JSON string with `type: "image_generation"`, the ChatGPT `conversationId`, and an `images` array containing local `path`, `contentType`, `bytes`, `width`, `height`, `title`, and source file ids.
+The job result is a JSON string with `type: "image_generation"`, the ChatGPT `conversationId`, `conversationDeleted`, and an `images` array containing local `path`, `contentType`, `bytes`, `width`, `height`, `title`, and source file ids.
 
 Image jobs default to a 10-minute request timeout. Increase it for complex generations:
 
 ```sh
 pro-cli job create @image-prompt.md --model image --wait --timeout 1200000 --json
 ```
+
+### Editing Images
+
+Edit an image by attaching a source file; pro-cli uploads it into a fresh saved conversation, asks the image tool to apply your prompt, downloads the result, and deletes the conversation:
+
+```sh
+pro-cli ask "Recolor the attached icon to blue; keep everything else identical" \
+  --model image --attach ./icon.png --json
+```
+
+`--attach <path>` is repeatable and accepts png, jpg/jpeg, webp, and gif. It also works on plain Pro asks (vision input), for example asking Pro about a screenshot. Uploaded source images are excluded from the downloaded results, so the result JSON only lists newly generated files.
 
 Probability and plan:
 
@@ -247,7 +260,17 @@ ChatGPT does not expose a standalone limits endpoint, so counters refresh whenev
 
 New `ask` and `job create` requests default to temporary ChatGPT conversations. Use `--save` when the turn should be written to ChatGPT history.
 
-Deep Research and image generation require saved conversations because ChatGPT completes those workflows asynchronously outside the initial response stream.
+Deep Research and image generation require saved conversations because ChatGPT completes those workflows asynchronously outside the initial response stream. Image conversations are deleted automatically after the files download (see Image Generation); Deep Research conversations are kept.
+
+Inspect or clean up saved conversations directly:
+
+```sh
+pro-cli conversations list --limit 50 --json
+pro-cli conversations archive <id> [<id> ...] --json
+pro-cli conversations delete <id> [<id> ...] --json
+```
+
+`archive` hides a conversation from the sidebar but keeps it recoverable under Settings, then Archived chats. `delete` is ChatGPT's real delete (`is_visible: false`).
 
 Continuing a conversation defaults to saved mode and requires both ids from the ChatGPT conversation:
 
@@ -257,12 +280,12 @@ pro-cli ask "follow up" --save --conversation <conversation-id> --parent <messag
 
 ## Thinking Modes
 
-By default, `pro-cli` sends `--model gpt-5-5-pro --reasoning standard`. The request includes `thinking_effort=standard`, so it uses the Pro model rather than ChatGPT web's default picker.
+By default, `pro-cli` sends `--model gpt-5-6-pro --reasoning standard`. The request includes `thinking_effort=standard`, so it uses the Pro model rather than ChatGPT web's default picker.
 
-For deeper Pro reasoning:
+For deeper Pro reasoning, use the model that still exposes Extended Pro:
 
 ```sh
---reasoning extended
+--model gpt-5-5-pro --reasoning extended
 ```
 
 Use exact web effort values:
@@ -274,7 +297,7 @@ min
 max
 ```
 
-Pro models normally expose `standard` and `extended`. Thinking models may expose `min`, `standard`, `extended`, and `max`. For explicit model ids, use an effort shown by:
+GPT-5.6 Pro exposes only `standard` (live catalog, 2026-07-29): the web picker has no Extended toggle for it, and GPT-5.5 Pro is now listed under "Legacy models" as the only Pro with `extended`. The backend mirrors any `thinking_effort` string back for `gpt-5-6-pro` (even `max`) without changing observable behavior, so pro-cli rejects `--reasoning` values the catalog does not list for the model and falls back to `standard` when a configured default is unsupported. Thinking models may expose `min`, `standard`, `extended`, and `max`. For explicit model ids, use an effort shown by:
 
 ```sh
 pro-cli models --json
@@ -291,6 +314,8 @@ pro-cli models --json
 --save
 --conversation <conversation-id>
 --parent <message-id>
+--attach <image-path> (repeatable)
+--keep-conversation
 --verbosity low|medium|high
 --instructions "system text"
 --instructions-file prompt-system.txt

@@ -301,6 +301,86 @@ All variants returned HTTP 200 and normal answer text. None produced token proba
 
 This does not prove no internal endpoint can expose logprobs. It means the current web conversation path does not expose them in the stream.
 
+## 2026-07-29 Findings
+
+Validated live against the authenticated session on July 29, 2026.
+
+### Model Catalog Refresh
+
+`GET /backend-api/models` now includes the GPT-5.6 generation:
+
+```txt
+gpt-5-6-pro        GPT-5.6 Pro       reasoning_type=pro   thinking_efforts=["standard"]  max_tokens=410000
+gpt-5-6-thinking   GPT-5.6 Thinking  reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+gpt-5.6-sol-wm     GPT-5.6 Sol       reasoning_type=reasoning  min/standard/extended/max
+gpt-5.6-terra-wm   GPT-5.6 Terra     reasoning_type=reasoning  min/standard/extended/max
+gpt-5.6-luna-wm    GPT-5.6 Luna      reasoning_type=reasoning  min/standard/extended/max
+```
+
+`gpt-5-6-pro` advertises only `standard` thinking effort; `gpt-5-5-pro` remains available with `standard` and `extended` ("Extended Pro") but its picker category is tagged `subcategory: "Legacy models"`. `pro-cli` now defaults to `gpt-5-6-pro`.
+
+### Extended Reasoning Probe (gpt-5-6-pro)
+
+Same-day probes of `thinking_effort` handling on `gpt-5-6-pro`, temporary chats, one prompt per run:
+
+```txt
+requested effort   HTTP   stream echo                       resolved_model_slug   behavior
+standard           200    thinking_effort: "standard"       gpt-5-6-pro           normal
+extended           200    thinking_effort: "extended"       gpt-5-6-pro           normal
+max (never valid   200    thinking_effort: "max"            gpt-5-6-pro           normal
+for pro models)
+```
+
+Conclusions:
+
+- The stream's `thinking_effort` metadata is a request mirror, not proof of applied effort: `max` is echoed verbatim even though no Pro model has ever exposed it. The field is not validated per model server-side.
+- No stream field discriminates applied effort: no paragen/parallel/sample-count markers, `auto_switcher_race_winner: null`, `did_auto_switch_to_reasoning: false` in every run.
+- Reasoning durations on a shared moderately hard prompt were indistinguishable (gpt-5-6-pro standard 32s, extended 19s, gpt-5-5-pro extended 29s), so duration evidence is inconclusive at this prompt difficulty.
+- Product-side the answer is clear: the web picker offers no Extended toggle for GPT-5.6 Pro, so "extended on 5.6 Pro" does not exist as a product feature. Treat unlisted efforts as no-ops. `pro-cli` therefore rejects `--reasoning` values the static catalog does not list for a known model and clamps unsupported configured defaults to `standard`.
+
+### Temporary Chats Still Cannot Generate Images
+
+A temporary-chat request (`history_and_training_disabled: true`) asking for image generation produced an assistant turn that stated the image generation tool is not available in temporary chats, then fell back to writing an SVG through code interpreter. The image tool is only mounted in saved conversations; `--model image` continues to force saved mode.
+
+### image_gen Limits Counter
+
+`conversation_detail_metadata.limits_progress` now includes an `image_gen` feature counter (observed `remaining: 935` with a daily-looking `reset_after`). It flows into `pro-cli limits` through the existing stream-side capture alongside `deep_research` and `odyssey`.
+
+### File Upload (Attachments)
+
+Three-step upload used by `--attach`:
+
+```txt
+POST /backend-api/files                          {file_name, file_size, use_case: "multimodal", ...}
+                                                 -> {status: "success", file_id: "file_0000...", upload_url}
+PUT  <upload_url>                                raw bytes, x-ms-blob-type: BlockBlob
+POST /backend-api/files/{file_id}/uploaded       -> {status: "success", download_url}
+```
+
+The `upload_url` host (`*.oaiusercontent.com`) is Cloudflare-fronted and rejects non-browser TLS signatures (403 error 1010), so the PUT must run inside the CDP page like the conversation calls. Attached images ride in the user message as:
+
+```json
+{
+  "content_type": "multimodal_text",
+  "parts": [
+    { "content_type": "image_asset_pointer", "asset_pointer": "file-service://<file_id>", "size_bytes": 0, "width": 0, "height": 0 },
+    "<prompt>"
+  ]
+}
+```
+
+plus `metadata.attachments: [{id, name, size, mime_type, width, height}]`. Note: conversation polling sees the uploaded file as an `image_asset_pointer` part too, so result extraction must exclude uploaded file ids or it returns the source image as the "generated" output.
+
+### Conversation Cleanup Endpoints
+
+```txt
+PATCH /backend-api/conversation/{id}  {"is_archived": true|false}   200 {"success":true}   archive/unarchive
+PATCH /backend-api/conversation/{id}  {"is_visible": false}         200 {"success":true}   ChatGPT's delete
+GET   /backend-api/conversations?offset=&limit=&order=updated       sidebar list (archived items drop out)
+```
+
+These work with plain bearer-token fetches outside the browser (no sentinel required). `pro-cli` deletes image conversations after downloading results and exposes `conversations list|archive|delete`.
+
 ## Exploration Playbook
 
 Use CDP network tracing and keep each experiment small.

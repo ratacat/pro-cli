@@ -37,10 +37,17 @@ describe("model discovery", () => {
 
     expect(result.source).toBe("static");
     expect(result.warning).toContain("No captured ChatGPT session token");
-    expect(result.defaultModel).toBe("gpt-5-5-pro");
+    expect(result.defaultModel).toBe("gpt-5-6-pro");
     expect(result.models.map((model) => model.id)).not.toContain("auto");
+    expect(result.models.map((model) => model.id)).toContain("gpt-5-6-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-5-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-4-5");
+    expect(result.models.find((model) => model.id === "gpt-5-6-pro")).toMatchObject({
+      label: "GPT-5.6 Pro",
+      reasoningLevels: ["standard"],
+      reasoningType: "pro",
+      default: true,
+    });
     expect(result.models.find((model) => model.id === "research")).toMatchObject({
       label: "Deep Research",
       reasoningLevels: ["standard", "extended"],
@@ -89,13 +96,13 @@ describe("model discovery", () => {
       expect(authHeader).toStartWith("Bearer ");
       expect(accountHeader).toBe("acct_test");
       expect(result.source).toBe("live");
-      expect(result.defaultModel).toBe("gpt-5-5-pro");
+      expect(result.defaultModel).toBe("gpt-5-6-pro");
       expect(result.chatgptDefaultModel).toBe("gpt-5-5");
       expect(result.modelPickerVersion).toBe(2);
       expect(result.models[0]).toMatchObject({
         id: "gpt-5-5-pro",
         label: "GPT-5.5 Pro",
-        default: true,
+        default: false,
         maxTokens: 272000,
         reasoningLevels: ["standard", "extended"],
         enabledTools: ["python", "web"],

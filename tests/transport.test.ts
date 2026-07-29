@@ -131,6 +131,9 @@ describe("ChatGPT transport", () => {
         const tasks: string[] = [];
         const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
           calls.push(expression);
+          if (expression.includes('"method":"PATCH"') || expression.includes("is_visible")) {
+            return { ok: true, status: 200 } as T;
+          }
           if (expression.includes("/backend-api/conversation/")) {
             return {
               ok: true,
@@ -179,10 +182,12 @@ describe("ChatGPT transport", () => {
         const parsed = JSON.parse(result) as {
           type: string;
           conversationId: string;
+          conversationDeleted: boolean;
           images: Array<{ path: string; fileId: string; width: number; height: number; title: string }>;
         };
         expect(parsed.type).toBe("image_generation");
         expect(parsed.conversationId).toBe("conversation-image");
+        expect(parsed.conversationDeleted).toBe(true);
         expect(parsed.images).toHaveLength(1);
         expect(parsed.images[0].fileId).toBe("file_image_1");
         expect(parsed.images[0].width).toBe(1024);
@@ -192,10 +197,183 @@ describe("ChatGPT transport", () => {
         expect(tasks).toEqual(["image:conversation-image"]);
 
         const requestBody = requestBodyFromExpression(calls[0]);
-        expect(requestBody.model).toBe("gpt-5-5-pro");
+        expect(requestBody.model).toBe("gpt-5-6-pro");
+        const patchCall = calls.find((call) => call.includes("is_visible"));
+        expect(patchCall).toBeDefined();
         expect(requestBody.history_and_training_disabled).toBeUndefined();
         expect((requestBody.messages as Array<{ content: { parts: string[] } }>)[0].content.parts[0])
           .toContain("Use ChatGPT image generation tools");
+      } finally {
+        await rm(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("keeps the image conversation when keepImageConversation is set", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const artifactDir = await mkdtemp(join(tmpdir(), "pro-image-keep-"));
+      try {
+        const calls: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+          calls.push(expression);
+          if (expression.includes("is_visible")) {
+            throw new Error("Cleanup PATCH must not run with keepImageConversation.");
+          }
+          if (expression.includes("/backend-api/conversation/")) {
+            return {
+              ok: true,
+              status: 200,
+              title: "Kept image",
+              asyncStatus: 4,
+              assets: [
+                {
+                  fileId: "file_kept_image",
+                  assetPointer: "sediment://file_kept_image",
+                  width: 512,
+                  height: 512,
+                  sizeBytes: 4,
+                  title: "Kept image",
+                  genId: "gen_kept",
+                },
+              ],
+            } as T;
+          }
+          if (expression.includes("/backend-api/files/download/")) {
+            return {
+              ok: true,
+              status: 200,
+              contentType: "image/png",
+              bytes: 4,
+              base64: Buffer.from("keep").toString("base64"),
+              fileName: "kept.png",
+            } as T;
+          }
+          return { ok: true, status: 200, body: imageLaunchStream("conversation-kept") } as T;
+        });
+
+        const result = await runChatGptJob(job({ model: "image", reasoning: "standard" }), {
+          sessionTokenPath,
+          pageEvaluator,
+          artifactDir,
+          keepImageConversation: true,
+        });
+
+        const parsed = JSON.parse(result) as { conversationDeleted: boolean };
+        expect(parsed.conversationDeleted).toBe(false);
+        expect(calls.some((call) => call.includes("is_visible"))).toBe(false);
+      } finally {
+        await rm(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("uploads attachments, sends multimodal parts, and excludes uploads from image results", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const artifactDir = await mkdtemp(join(tmpdir(), "pro-image-attach-"));
+      try {
+        const attachmentPath = join(artifactDir, "source.png");
+        await writeFile(attachmentPath, "source-bytes");
+        const calls: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+          calls.push(expression);
+          if (expression.includes("use_case")) {
+            return {
+              ok: true,
+              step: "done",
+              status: 200,
+              fileId: "file_upload_1",
+              width: 640,
+              height: 480,
+              error: null,
+            } as T;
+          }
+          if (expression.includes("is_visible")) {
+            return { ok: true, status: 200 } as T;
+          }
+          if (expression.includes("/backend-api/conversation/")) {
+            return {
+              ok: true,
+              status: 200,
+              title: "Edited image",
+              asyncStatus: 4,
+              assets: [
+                {
+                  fileId: "file_upload_1",
+                  assetPointer: "file-service://file_upload_1",
+                  width: 640,
+                  height: 480,
+                  sizeBytes: 12,
+                  title: null,
+                  genId: null,
+                },
+                {
+                  fileId: "file_edited_1",
+                  assetPointer: "sediment://file_edited_1",
+                  width: 1024,
+                  height: 1024,
+                  sizeBytes: 6,
+                  title: "Edited",
+                  genId: "gen_edited",
+                },
+              ],
+            } as T;
+          }
+          if (expression.includes("/backend-api/files/download/")) {
+            return {
+              ok: true,
+              status: 200,
+              contentType: "image/png",
+              bytes: 6,
+              base64: Buffer.from("edited").toString("base64"),
+              fileName: "edited.png",
+            } as T;
+          }
+          return { ok: true, status: 200, body: imageLaunchStream("conversation-edit") } as T;
+        });
+
+        const editJob = job({ model: "image", reasoning: "standard" });
+        editJob.options.attachments = [
+          { path: attachmentPath, name: "source.png", mimeType: "image/png" },
+        ];
+        const result = await runChatGptJob(editJob, {
+          sessionTokenPath,
+          pageEvaluator,
+          artifactDir,
+        });
+
+        const parsed = JSON.parse(result) as {
+          conversationDeleted: boolean;
+          images: Array<{ fileId: string }>;
+        };
+        expect(parsed.images).toHaveLength(1);
+        expect(parsed.images[0].fileId).toBe("file_edited_1");
+        expect(parsed.conversationDeleted).toBe(true);
+
+        const submission = calls.find((call) => call.includes("/backend-api/f/conversation"));
+        expect(submission).toBeDefined();
+        const requestBody = requestBodyFromExpression(submission ?? "");
+        const message = (requestBody.messages as Array<{
+          content: { content_type: string; parts: Array<unknown> };
+          metadata: { attachments?: Array<Record<string, unknown>> };
+        }>)[0];
+        expect(message.content.content_type).toBe("multimodal_text");
+        expect(message.content.parts[0]).toMatchObject({
+          content_type: "image_asset_pointer",
+          asset_pointer: "file-service://file_upload_1",
+          width: 640,
+          height: 480,
+        });
+        expect(typeof message.content.parts[1]).toBe("string");
+        expect(message.metadata.attachments).toEqual([
+          {
+            id: "file_upload_1",
+            name: "source.png",
+            size: 12,
+            mime_type: "image/png",
+            width: 640,
+            height: 480,
+          },
+        ]);
       } finally {
         await rm(artifactDir, { recursive: true, force: true });
       }

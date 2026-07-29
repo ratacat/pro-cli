@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
 import { chatGptOrigins } from "./cookies";
@@ -35,6 +35,7 @@ export interface TransportOptions {
   onLimits?: (observations: LimitsObservation[]) => void;
   onResearchTask?: (task: ResearchTask) => void | Promise<void>;
   onResearchTaskStatus?: (update: ResearchTaskStatusUpdate) => void | Promise<void>;
+  keepImageConversation?: boolean;
 }
 
 export interface ResearchTask {
@@ -47,15 +48,31 @@ export interface ResearchTaskStatusUpdate extends ResearchTask {
   status: string;
 }
 
+export interface JobAttachmentInput {
+  path: string;
+  name: string;
+  mimeType: string;
+}
+
+export interface UploadedAttachment {
+  fileId: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+}
+
 export async function runChatGptJob(job: JobRecord, options: TransportOptions): Promise<string> {
   const session = await loadFreshSession(options.sessionTokenPath);
   const retries = integerOption(options.retries, 0, 0, 5) ?? 0;
   const retryDelayMs = integerOption(options.retryDelayMs, 500, 0, 60_000) ?? 500;
+  const attachments = await uploadJobAttachments(job, options);
   let lastError: ProError | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await postChatGptJob(job, { accountId: session.accountId }, options);
+      return await postChatGptJob(job, { accountId: session.accountId }, options, attachments);
     } catch (error) {
       const proError = error instanceof ProError ? error : networkError(error);
       lastError = proError;
@@ -134,15 +151,22 @@ async function postChatGptJob(
   job: JobRecord,
   session: { accountId: string },
   options: TransportOptions,
+  attachments: UploadedAttachment[] = [],
 ): Promise<string> {
   const timeoutMs = integerOption(options.timeoutMs ?? job.options.timeoutMs, 0, 0, MAX_REQUEST_TIMEOUT_MS) ?? 0;
 
   try {
     const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
     const cdpBase = options.cdpBase ?? DEFAULT_CDP_BASE;
+    const continuedImageConversationId =
+      canonicalModelId(job.model) === "image" ? stringOption(job.options.conversationId) : undefined;
+    const baselineImageFileIds = continuedImageConversationId
+      ? await fetchExistingImageFileIds(continuedImageConversationId, evaluate, cdpBase)
+      : new Set<string>();
+    for (const attachment of attachments) baselineImageFileIds.add(attachment.fileId);
     let browserResult = await evaluate<BrowserFetchResult>(
       cdpBase,
-      buildBrowserFetchExpression(buildRequestBody(job), session.accountId),
+      buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId),
       timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
     );
     if (!options.pageEvaluator && shouldRecoverCookieBloat(browserResult)) {
@@ -150,7 +174,7 @@ async function postChatGptJob(
       if (recovered?.deleted) {
         browserResult = await evaluate<BrowserFetchResult>(
           cdpBase,
-          buildBrowserFetchExpression(buildRequestBody(job), session.accountId),
+          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId),
           timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
         );
       }
@@ -243,6 +267,7 @@ async function postChatGptJob(
         jobId: job.id,
         prompt: job.prompt,
         initialText: parsed.text,
+        ...(baselineImageFileIds.size > 0 ? { excludeFileIds: baselineImageFileIds } : {}),
       });
     }
     if (model === "research") {
@@ -990,7 +1015,7 @@ interface PreparedChatRequirements {
   };
 }
 
-function buildRequestBody(job: JobRecord): Record<string, unknown> {
+function buildRequestBody(job: JobRecord, attachments: UploadedAttachment[] = []): Record<string, unknown> {
   const requestedModel = canonicalModelId(job.model);
   const isResearch = requestedModel === "research";
   const isImage = requestedModel === "image";
@@ -1012,8 +1037,16 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
         id: randomUUID(),
         author: { role: "user" },
         create_time: Math.floor(Date.now() / 1000),
-        content: { content_type: "text", parts: [prompt] },
-        metadata: isResearch ? deepResearchMessageMetadata() : {},
+        content: attachments.length > 0
+          ? {
+              content_type: "multimodal_text",
+              parts: [...attachments.map(imageAssetPart), prompt],
+            }
+          : { content_type: "text", parts: [prompt] },
+        metadata: {
+          ...(isResearch ? deepResearchMessageMetadata() : {}),
+          ...(attachments.length > 0 ? { attachments: attachments.map(attachmentMetadata) } : {}),
+        },
       },
     ],
     model,
@@ -1048,6 +1081,27 @@ function buildRequestBody(job: JobRecord): Record<string, unknown> {
   if (thinkingEffort) body.thinking_effort = thinkingEffort;
 
   return body;
+}
+
+function imageAssetPart(attachment: UploadedAttachment): Record<string, unknown> {
+  return {
+    content_type: "image_asset_pointer",
+    asset_pointer: `file-service://${attachment.fileId}`,
+    size_bytes: attachment.sizeBytes,
+    width: attachment.width ?? 0,
+    height: attachment.height ?? 0,
+  };
+}
+
+function attachmentMetadata(attachment: UploadedAttachment): Record<string, unknown> {
+  return {
+    id: attachment.fileId,
+    name: attachment.name,
+    size: attachment.sizeBytes,
+    mime_type: attachment.mimeType,
+    width: attachment.width ?? 0,
+    height: attachment.height ?? 0,
+  };
 }
 
 function deepResearchMessageMetadata(): Record<string, unknown> {
@@ -1505,6 +1559,7 @@ interface ImageArtifact {
 interface ImageGenerationResult {
   type: "image_generation";
   conversationId: string;
+  conversationDeleted: boolean;
   text: string | null;
   images: ImageArtifact[];
 }
@@ -1515,7 +1570,7 @@ async function waitForImageResult(
   cdpBase: string,
   timeoutMs: number,
   options: TransportOptions,
-  context: { jobId: string; prompt: string; initialText: string },
+  context: { jobId: string; prompt: string; initialText: string; excludeFileIds?: Set<string> },
 ): Promise<string> {
   const artifactDir = options.artifactDir;
   if (!artifactDir) {
@@ -1557,7 +1612,10 @@ async function waitForImageResult(
       });
     }
 
-    if (result.assets.length > 0) {
+    const assets = context.excludeFileIds
+      ? result.assets.filter((asset) => !context.excludeFileIds?.has(asset.fileId))
+      : result.assets;
+    if (assets.length > 0) {
       await options.onResearchTaskStatus?.({
         taskId: imageTaskId(conversationId),
         title: result.title ?? "Image generation",
@@ -1566,7 +1624,7 @@ async function waitForImageResult(
       });
       await mkdir(artifactDir, { recursive: true, mode: 0o700 });
       const images: ImageArtifact[] = [];
-      for (const [index, asset] of result.assets.entries()) {
+      for (const [index, asset] of assets.entries()) {
         const download = await downloadImageAsset(asset.fileId, evaluate, cdpBase);
         const extension = imageExtension(download.contentType);
         const path = join(artifactDir, `image-${index + 1}.${extension}`);
@@ -1583,9 +1641,18 @@ async function waitForImageResult(
           genId: asset.genId,
         });
       }
+      let conversationDeleted = false;
+      if (!options.keepImageConversation) {
+        conversationDeleted = await evaluate<BrowserConversationPatchResult>(
+          cdpBase,
+          buildConversationPatchExpression(conversationId, { is_visible: false }),
+          30_000,
+        ).then((patch) => patch.ok === true).catch(() => false);
+      }
       const payload: ImageGenerationResult = {
         type: "image_generation",
         conversationId,
+        conversationDeleted,
         text: context.initialText.trim() ? context.initialText : null,
         images,
       };
@@ -2080,7 +2147,7 @@ function buildImageAssetsFetchExpression(conversationId: string): string {
         const image = part as Record<string, unknown>;
         if (image.content_type !== "image_asset_pointer") continue;
         const assetPointer = typeof image.asset_pointer === "string" ? image.asset_pointer : "";
-        const fileId = assetPointer.replace(/^sediment:\/\//, "");
+        const fileId = assetPointer.replace(/^(sediment|file-service):\/\//, "");
         if (!assetPointer || !fileId) continue;
         const imageMetadata = image.metadata && typeof image.metadata === "object"
           ? image.metadata as Record<string, unknown>
@@ -2169,6 +2236,255 @@ function buildImageDownloadExpression(fileId: string): string {
       fileName: typeof metadata.file_name === "string" ? metadata.file_name : null,
     };
   }})(${JSON.stringify(fileId)})`;
+}
+
+interface BrowserAttachmentUploadResult {
+  ok: boolean;
+  step: string;
+  status: number;
+  fileId: string | null;
+  width: number | null;
+  height: number | null;
+  error: string | null;
+}
+
+interface BrowserConversationPatchResult {
+  ok: boolean;
+  status: number;
+}
+
+function readAttachmentInputs(value: unknown): JobAttachmentInput[] {
+  if (!Array.isArray(value)) return [];
+  const inputs: JobAttachmentInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const path = stringOption(record.path);
+    if (!path) continue;
+    const name = stringOption(record.name) ?? path.split("/").pop() ?? "attachment";
+    const mimeType = stringOption(record.mimeType);
+    if (!mimeType) continue;
+    inputs.push({ path, name, mimeType });
+  }
+  return inputs;
+}
+
+async function uploadJobAttachments(job: JobRecord, options: TransportOptions): Promise<UploadedAttachment[]> {
+  const inputs = readAttachmentInputs(job.options.attachments);
+  if (inputs.length === 0) return [];
+  const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
+  const cdpBase = options.cdpBase ?? DEFAULT_CDP_BASE;
+  const uploaded: UploadedAttachment[] = [];
+  for (const input of inputs) {
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(input.path);
+    } catch (error) {
+      throw new ProError("ATTACHMENT_READ_FAILED", `Could not read attachment ${input.path}.`, {
+        exitCode: EXIT.invalidArgs,
+        suggestions: ["Pass --attach with a readable image file path."],
+        details: { path: input.path, error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+    const result = await evaluate<BrowserAttachmentUploadResult>(
+      cdpBase,
+      buildAttachmentUploadExpression({
+        name: input.name,
+        mimeType: input.mimeType,
+        base64: bytes.toString("base64"),
+      }),
+      120_000,
+    );
+    if (!result.ok || !result.fileId) {
+      throw new ProError(
+        "ATTACHMENT_UPLOAD_FAILED",
+        `ChatGPT upload failed for ${input.name} (${result.step} returned HTTP ${result.status}).`,
+        {
+          exitCode: EXIT.upstream,
+          suggestions: [
+            "Retry the request.",
+            "Confirm the CDP ChatGPT tab is logged in with pro-cli doctor --json.",
+          ],
+          details: { name: input.name, step: result.step, status: result.status, preview: result.error?.slice(0, 200) },
+        },
+      );
+    }
+    uploaded.push({
+      fileId: result.fileId,
+      name: input.name,
+      mimeType: input.mimeType,
+      sizeBytes: bytes.length,
+      width: result.width,
+      height: result.height,
+    });
+  }
+  return uploaded;
+}
+
+async function fetchExistingImageFileIds(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<Set<string>> {
+  const result = await evaluate<BrowserImageAssetsFetchResult>(
+    cdpBase,
+    buildImageAssetsFetchExpression(conversationId),
+    30_000,
+  ).catch(() => null);
+  return new Set((result?.ok ? result.assets : []).map((asset) => asset.fileId));
+}
+
+function buildAttachmentUploadExpression(input: { name: string; mimeType: string; base64: string }): string {
+  return `(${async function uploadAttachment(payload: {
+    name: string;
+    mimeType: string;
+    base64: string;
+  }): Promise<BrowserAttachmentUploadResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const headers = {
+      accept: "application/json",
+      "content-type": "application/json",
+      ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+    };
+    const binary = atob(payload.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const createResponse = await fetch("https://chatgpt.com/backend-api/files", {
+      method: "POST",
+      credentials: "include",
+      referrer: "https://chatgpt.com/",
+      headers,
+      body: JSON.stringify({
+        file_name: payload.name,
+        file_size: bytes.length,
+        use_case: "multimodal",
+        reset_rate_limits: false,
+        timezone_offset_min: new Date().getTimezoneOffset(),
+      }),
+    });
+    const created = (await createResponse.json().catch(() => null)) as
+      | { status?: unknown; upload_url?: unknown; file_id?: unknown }
+      | null;
+    if (
+      !createResponse.ok ||
+      !created ||
+      typeof created.upload_url !== "string" ||
+      typeof created.file_id !== "string"
+    ) {
+      return {
+        ok: false,
+        step: "create",
+        status: createResponse.status,
+        fileId: null,
+        width: null,
+        height: null,
+        error: JSON.stringify(created ?? null).slice(0, 300),
+      };
+    }
+    const putResponse = await fetch(created.upload_url, {
+      method: "PUT",
+      headers: {
+        "x-ms-blob-type": "BlockBlob",
+        "x-ms-version": "2020-04-08",
+        "content-type": payload.mimeType,
+      },
+      body: bytes,
+    });
+    if (!putResponse.ok) {
+      return {
+        ok: false,
+        step: "put",
+        status: putResponse.status,
+        fileId: null,
+        width: null,
+        height: null,
+        error: (await putResponse.text().catch(() => "")).slice(0, 300),
+      };
+    }
+    const doneResponse = await fetch(
+      `https://chatgpt.com/backend-api/files/${encodeURIComponent(created.file_id)}/uploaded`,
+      {
+        method: "POST",
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers,
+        body: "{}",
+      },
+    );
+    const done = (await doneResponse.json().catch(() => null)) as { status?: unknown } | null;
+    if (!doneResponse.ok || !done || done.status !== "success") {
+      return {
+        ok: false,
+        step: "uploaded",
+        status: doneResponse.status,
+        fileId: null,
+        width: null,
+        height: null,
+        error: JSON.stringify(done ?? null).slice(0, 300),
+      };
+    }
+    let width: number | null = null;
+    let height: number | null = null;
+    try {
+      // Page-evaluated code: createImageBitmap exists in Chrome but not in Bun's ambient types.
+      const pageGlobals: {
+        createImageBitmap?: (blob: Blob) => Promise<{ width: number; height: number; close: () => void }>;
+      } = globalThis;
+      const bitmapFactory = pageGlobals.createImageBitmap;
+      if (bitmapFactory) {
+        const bitmap = await bitmapFactory(new Blob([bytes], { type: payload.mimeType }));
+        width = bitmap.width;
+        height = bitmap.height;
+        bitmap.close();
+      }
+    } catch {
+      width = null;
+      height = null;
+    }
+    return {
+      ok: true,
+      step: "done",
+      status: doneResponse.status,
+      fileId: created.file_id,
+      width,
+      height,
+      error: null,
+    };
+  }})(${JSON.stringify(input)})`;
+}
+
+function buildConversationPatchExpression(conversationId: string, patch: Record<string, unknown>): string {
+  return `(${async function patchConversation(
+    id: string,
+    body: Record<string, unknown>,
+  ): Promise<BrowserConversationPatchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    return { ok: response.ok, status: response.status };
+  }})(${JSON.stringify(conversationId)}, ${JSON.stringify(patch)})`;
 }
 
 function extractAsyncResearchTask(event: unknown): ResearchTask | null {
