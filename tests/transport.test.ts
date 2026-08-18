@@ -1042,6 +1042,37 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("reconciles a saved Pro response when the SSE stream completes without assistant text", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("fetchConversationResult")) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "finished_successfully",
+            finalText: "Recovered from the saved conversation.",
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: savedEmptyConversationStream("conversation-reconcile"),
+        } as T;
+      });
+
+      const savedJob = job();
+      savedJob.options.temporary = false;
+      const result = await runChatGptJob(savedJob, { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("Recovered from the saved conversation.");
+      expect(calls).toHaveLength(2);
+      expect(calls[1]).toContain("/backend-api/conversation/");
+      expect(calls[1]).toContain("fetchConversationResult");
+    });
+  });
+
   test("reads patch-style /f/conversation streams", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(): Promise<T> =>
@@ -1418,6 +1449,14 @@ function base64Url(value: string): string {
 function conversationStream(text: string): string {
   return [
     `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function savedEmptyConversationStream(conversationId: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"type":"message_stream_complete"}`,
     "data: [DONE]",
     "",
   ].join("\n\n");
