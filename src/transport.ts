@@ -15,6 +15,7 @@ const DEFAULT_RESEARCH_TASK_POLL_MS = 5_000;
 const DEFAULT_RESEARCH_WIDGET_POLL_MS = 30_000;
 const DEFAULT_RESEARCH_WIDGET_RATE_LIMIT_POLL_MS = 60_000;
 const DEFAULT_BROWSER_REQUEST_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_CONVERSATION_RESULT_POLL_MS = 5_000;
 const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
 const DEEP_RESEARCH_CONNECTOR_ID = "connector_openai_deep_research";
 const DEEP_RESEARCH_ROUTER_MODEL = "gpt-5-5";
@@ -240,8 +241,13 @@ async function postChatGptJob(
     }
 
     const model = canonicalModelId(job.model);
+    const reconcileSavedResponse =
+      model !== "image" &&
+      model !== "research" &&
+      isSavedConversation(job) &&
+      !stringOption(job.options.conversationId);
     const parsed = readResponse(browserResult.body, options.onLimits, {
-      allowEmptyWithConversation: model === "image",
+      allowEmptyWithConversation: model === "image" || reconcileSavedResponse,
     });
     if (model === "image") {
       if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
@@ -298,12 +304,112 @@ async function postChatGptJob(
         );
       }
     }
-    validateCompletedResult(job, parsed.text);
-    return parsed.text;
+    const reconciledText = reconcileSavedResponse && !parsed.text && parsed.conversationId
+      ? await waitForConversationResult(parsed.conversationId, evaluate, cdpBase, timeoutMs)
+      : null;
+    const resultText = reconciledText ?? parsed.text;
+    if (!resultText && reconcileSavedResponse && parsed.conversationId) {
+      throw emptyResponseError(parsed.conversationId, timeoutMs);
+    }
+    validateCompletedResult(job, resultText);
+    if (job.options.deleteConversationAfterResult === true && parsed.conversationId) {
+      await evaluate<BrowserConversationPatchResult>(
+        cdpBase,
+        buildConversationPatchExpression(parsed.conversationId, { is_visible: false }),
+        30_000,
+      ).catch(() => null);
+    }
+    return resultText;
   } catch (error) {
     if (error instanceof ProError) throw error;
     throw networkError(error);
   }
+}
+
+function isSavedConversation(job: JobRecord): boolean {
+  const conversationId = stringOption(job.options.conversationId);
+  return booleanOption(job.options.temporary, !conversationId) === false;
+}
+
+function emptyResponseError(conversationId: string, timeoutMs: number): ProError {
+  return new ProError(
+    "EMPTY_RESPONSE",
+    "ChatGPT completed without returning assistant text, and the saved conversation did not expose a final answer before the reconciliation timeout.",
+    {
+      exitCode: timeoutMs > 0 ? EXIT.timeout : EXIT.upstream,
+      suggestions: [
+        "Open the saved ChatGPT conversation to inspect whether the response is still running.",
+        "Increase --timeout for long GPT-5.6 Pro tasks before retrying the same real request.",
+        "Do not send a probe or smoke-test query; a saved conversation may still finish asynchronously.",
+      ],
+      details: {
+        conversationId,
+        reconciliation: "timed_out",
+        timeoutMs: timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
+      },
+    },
+  );
+}
+
+async function waitForConversationResult(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  const startedAt = Date.now();
+  const effectiveTimeoutMs = timeoutMs > 0 ? timeoutMs : DEFAULT_BROWSER_REQUEST_TIMEOUT_MS;
+
+  while (true) {
+    const remainingMs = effectiveTimeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) return null;
+
+    let result: BrowserConversationResultFetchResult;
+    try {
+      result = await evaluate<BrowserConversationResultFetchResult>(
+        cdpBase,
+        buildConversationResultFetchExpression(conversationId),
+        Math.min(remainingMs, 30_000),
+      );
+    } catch (error) {
+      const cause = error instanceof ProError ? error : networkError(error);
+      throw new ProError(
+        "CONVERSATION_RESULT_UNAVAILABLE",
+        `Saved ChatGPT conversation ${conversationId} could not be checked for its final answer.`,
+        {
+          exitCode: cause.exitCode,
+          suggestions: [
+            "Open the saved ChatGPT conversation to inspect the response directly.",
+            "Do not retry the original prompt; it may still finish in the saved conversation.",
+          ],
+          details: { conversationId, causeCode: cause.code },
+          cause,
+        },
+      );
+    }
+
+    if (result.ok && result.finalText) return result.finalText;
+    if (!result.ok && !isTransientConversationResultStatus(result.status)) {
+      throw new ProError(
+        "CONVERSATION_RESULT_UNAVAILABLE",
+        `Saved ChatGPT conversation ${conversationId} returned HTTP ${result.status}.`,
+        {
+          exitCode: EXIT.upstream,
+          suggestions: [
+            "Open the saved ChatGPT conversation to inspect the response directly.",
+            "Run pro-cli doctor --json if saved conversations consistently fail to load.",
+          ],
+          details: { conversationId, status: result.status, preview: result.preview },
+        },
+      );
+    }
+
+    await sleep(Math.min(DEFAULT_CONVERSATION_RESULT_POLL_MS, Math.max(1, remainingMs)));
+  }
+}
+
+function isTransientConversationResultStatus(status: number): boolean {
+  return status === 404 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 function shouldRecoverCookieBloat(result: BrowserFetchResult): boolean {
@@ -1501,10 +1607,93 @@ async function waitForResearchWidgetFromConversation(
   return null;
 }
 
+function buildConversationResultFetchExpression(conversationId: string): string {
+  return `(${async function fetchConversationResult(id: string): Promise<BrowserConversationResultFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const text = await response.text().catch(() => "");
+    let body: unknown = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+
+    const record = body && typeof body === "object" ? body as Record<string, unknown> : {};
+    const mapping = record.mapping && typeof record.mapping === "object"
+      ? record.mapping as Record<string, { message?: unknown }>
+      : {};
+    const candidates: Array<{ text: string; status: string; endTurn: boolean | null; createTime: number; order: number }> = [];
+    let order = 0;
+    for (const node of Object.values(mapping)) {
+      const message = node?.message;
+      if (!message || typeof message !== "object") continue;
+      const messageRecord = message as Record<string, unknown>;
+      const author = messageRecord.author && typeof messageRecord.author === "object"
+        ? messageRecord.author as Record<string, unknown>
+        : {};
+      if (author.role !== "assistant") continue;
+      const recipient = typeof messageRecord.recipient === "string" ? messageRecord.recipient : "";
+      if (recipient && recipient !== "all") continue;
+      const metadata = messageRecord.metadata && typeof messageRecord.metadata === "object"
+        ? messageRecord.metadata as Record<string, unknown>
+        : {};
+      if (metadata.is_visually_hidden_from_conversation === true) continue;
+      const content = messageRecord.content && typeof messageRecord.content === "object"
+        ? messageRecord.content as Record<string, unknown>
+        : {};
+      const parts = Array.isArray(content.parts)
+        ? content.parts.filter((part): part is string => typeof part === "string").join("")
+        : typeof content.text === "string" ? content.text : "";
+      const status = typeof messageRecord.status === "string" ? messageRecord.status.toLowerCase() : "";
+      const endTurn = typeof messageRecord.end_turn === "boolean" ? messageRecord.end_turn : null;
+      const createTime = typeof messageRecord.create_time === "number" ? messageRecord.create_time : 0;
+      candidates.push({ text: parts, status, endTurn, createTime, order: order++ });
+    }
+
+    const latest = candidates.sort((left, right) => left.createTime - right.createTime || left.order - right.order).at(-1) ?? null;
+    const latestIsComplete = latest && ["finished_successfully", "completed", "complete"].includes(latest.status);
+    const latestHasUnknownStatus = latest && !latest.status;
+    const selected = latest && latest.endTurn !== false && (latestIsComplete || latestHasUnknownStatus) && latest.text.trim()
+      ? latest
+      : null;
+    return {
+      ok: response.ok,
+      status: response.status,
+      finalText: selected?.text ?? null,
+      statusText: selected?.status || null,
+      preview: text.replace(/\\s+/g, " ").slice(0, 240),
+    };
+  }})(${JSON.stringify(conversationId)})`;
+}
+
 interface BrowserConversationTaskFetchResult {
   ok: boolean;
   status: number;
   task: ResearchTask | null;
+  preview?: string;
+}
+
+interface BrowserConversationResultFetchResult {
+  ok: boolean;
+  status: number;
+  finalText: string | null;
+  statusText: string | null;
   preview?: string;
 }
 
@@ -2829,6 +3018,7 @@ function isAsyncArtifactError(code: string): boolean {
     code.startsWith("IMAGE_") ||
     code.startsWith("RESEARCH_TASK_") ||
     code.startsWith("RESEARCH_WIDGET_") ||
+    code.startsWith("CONVERSATION_RESULT_") ||
     code === "INCOMPLETE_RESEARCH_ACK"
   );
 }

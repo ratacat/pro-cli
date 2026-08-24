@@ -258,7 +258,7 @@ ChatGPT does not expose a standalone limits endpoint, so counters refresh whenev
 
 ## Conversations
 
-New `ask` and `job create` requests default to temporary ChatGPT conversations. Use `--save` when the turn should be written to ChatGPT history.
+New non-Pro `ask` and `job create` requests default to temporary ChatGPT conversations. Pro text requests use a saved conversation internally so `pro-cli` can recover answers that finish after the initial stream, then delete it after a successful result. Use `--temporary` to force the old non-recoverable temporary mode, or `--save` to keep the turn in ChatGPT history.
 
 Deep Research and image generation require saved conversations because ChatGPT completes those workflows asynchronously outside the initial response stream. Image conversations are deleted automatically after the files download (see Image Generation); Deep Research conversations are kept.
 

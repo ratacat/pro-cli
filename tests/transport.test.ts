@@ -1042,6 +1042,137 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("recovers and deletes an auto-saved Pro response when the initial stream has no text", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("fetchConversationResult")) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "finished_successfully",
+            finalText: "Recovered from the saved conversation.",
+          } as T;
+        }
+        if (expression.includes("is_visible")) {
+          return { ok: true, status: 200 } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: savedEmptyConversationStream("conversation-reconcile"),
+        } as T;
+      });
+      const savedJob = job();
+      savedJob.options.temporary = false;
+      savedJob.options.deleteConversationAfterResult = true;
+
+      const result = await runChatGptJob(savedJob, { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("Recovered from the saved conversation.");
+      expect(calls).toHaveLength(3);
+      expect(calls[1]).toContain("fetchConversationResult");
+      expect(calls[1]).toContain("is_visually_hidden_from_conversation");
+      expect(calls[1]).toContain("end_turn");
+      expect(calls[2]).toContain("is_visible");
+    });
+  });
+
+  test("does not delete an explicitly saved Pro conversation", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("is_visible")) {
+          throw new Error("Explicitly saved conversations must not be deleted.");
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: savedConversationStream("conversation-kept", "Kept answer."),
+        } as T;
+      });
+      const savedJob = job();
+      savedJob.options.temporary = false;
+
+      const result = await runChatGptJob(savedJob, { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("Kept answer.");
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  test("does not reconcile a continued conversation to a stale assistant answer", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const calls: string[] = [];
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        calls.push(expression);
+        if (expression.includes("fetchConversationResult")) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "finished_successfully",
+            finalText: "Stale previous answer.",
+          } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: savedEmptyConversationStream("conversation-continued"),
+        } as T;
+      });
+      const continuedJob = job();
+      continuedJob.options.temporary = false;
+      continuedJob.options.conversationId = "conversation-continued";
+      continuedJob.options.parentMessageId = "previous-assistant-message";
+
+      try {
+        await runChatGptJob(continuedJob, { sessionTokenPath, pageEvaluator });
+        throw new Error("Expected EMPTY_RESPONSE.");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ProError);
+        expect((error as ProError).code).toBe("EMPTY_RESPONSE");
+      }
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  test("does not resubmit a Pro prompt when saved-result polling loses connectivity", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let submissions = 0;
+      const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+        if (expression.includes("fetchConversationResult")) throw new Error("CDP disconnected");
+        submissions += 1;
+        return {
+          ok: true,
+          status: 200,
+          body: savedEmptyConversationStream("conversation-disconnected"),
+        } as T;
+      });
+      const savedJob = job();
+      savedJob.options.temporary = false;
+
+      try {
+        await runChatGptJob(savedJob, {
+          sessionTokenPath,
+          pageEvaluator,
+          retries: 1,
+          retryDelayMs: 0,
+        });
+        throw new Error("Expected CONVERSATION_RESULT_UNAVAILABLE.");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ProError);
+        expect((error as ProError).code).toBe("CONVERSATION_RESULT_UNAVAILABLE");
+        expect((error as ProError).details).toMatchObject({
+          attempts: 1,
+          conversationId: "conversation-disconnected",
+        });
+      }
+      expect(submissions).toBe(1);
+    });
+  });
+
   test("reads patch-style /f/conversation streams", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(): Promise<T> =>
@@ -1418,6 +1549,22 @@ function base64Url(value: string): string {
 function conversationStream(text: string): string {
   return [
     `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function savedConversationStream(conversationId: string, text: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+function savedEmptyConversationStream(conversationId: string): string {
+  return [
+    `data: {"conversation_id":${JSON.stringify(conversationId)},"type":"message_stream_complete"}`,
     "data: [DONE]",
     "",
   ].join("\n\n");

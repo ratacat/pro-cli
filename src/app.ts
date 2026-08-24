@@ -970,16 +970,29 @@ function applyModelConversationRequirements(
   flags: Map<string, string | boolean | string[]>,
   model: string,
 ): void {
-  if (!modelRequiresSavedConversation(model)) return;
-  const label = canonicalModelId(model) === "image" ? "Image generation" : "Deep Research";
   const store = readBooleanFlag(flags, "store");
   const requestedTemporary = flagBoolean(flags, "temporary") || store === false;
-  if (requestedTemporary) {
-    throw invalidArgs(`${label} does not support temporary chats.`, [
-      `Remove --temporary or --store false; pro-cli uses a saved ChatGPT conversation for --model ${canonicalModelId(model)}.`,
-    ]);
+  if (modelRequiresSavedConversation(model)) {
+    const label = canonicalModelId(model) === "image" ? "Image generation" : "Deep Research";
+    if (requestedTemporary) {
+      throw invalidArgs(`${label} does not support temporary chats.`, [
+        `Remove --temporary or --store false; pro-cli uses a saved ChatGPT conversation for --model ${canonicalModelId(model)}.`,
+      ]);
+    }
+    if (!options.conversationId) options.temporary = false;
+    return;
   }
-  if (!options.conversationId) options.temporary = false;
+
+  const explicitConversationMode =
+    requestedTemporary ||
+    flagBoolean(flags, "save") ||
+    flagBoolean(flags, "no-temporary") ||
+    store === true ||
+    Boolean(options.conversationId);
+  if (!explicitConversationMode && canonicalModelId(model).endsWith("-pro")) {
+    options.temporary = false;
+    if (!flagBoolean(flags, "keep-conversation")) options.deleteConversationAfterResult = true;
+  }
 }
 
 function applyModelTimeoutDefaults(

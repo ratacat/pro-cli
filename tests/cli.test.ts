@@ -232,10 +232,30 @@ describe("robot-mode CLI", () => {
       expect(created.data.job.prompt).toBe("");
       expect(created.data.job.promptPreview).toBe("hello from agent");
       expect(created.data.job.options.condensedResponseTokens).toBe(250);
+      expect(created.data.job.options.temporary).toBe(false);
+      expect(created.data.job.options.deleteConversationAfterResult).toBe(true);
 
       const status = await run(["job", "status", jobId, "--json"], { tty: true, home });
       expect(status.code).toBe(0);
       expect(JSON.parse(status.stdout).data.job.id).toBe(jobId);
+    });
+  });
+
+  test("preserves explicit temporary and saved Pro conversation modes", async () => {
+    await withHome(async (home) => {
+      const temporary = await run(
+        ["job", "create", "hello", "--no-start", "--temporary", "--json"],
+        { tty: true, home },
+      );
+      const saved = await run(
+        ["job", "create", "hello", "--no-start", "--save", "--json"],
+        { tty: true, home },
+      );
+
+      expect(temporary.code).toBe(0);
+      expect(saved.code).toBe(0);
+      expect(JSON.parse(temporary.stdout).data.job.options).toEqual({ temporary: true });
+      expect(JSON.parse(saved.stdout).data.job.options).toEqual({ temporary: false });
     });
   });
 
@@ -358,7 +378,8 @@ describe("robot-mode CLI", () => {
       const payload = JSON.parse(result.stdout);
       expect(payload.data.job.status).toBe("succeeded");
       expect(payload.data.job.prompt).toBe("");
-      expect(payload.data.job.options.temporary).toBe(true);
+      expect(payload.data.job.options.temporary).toBe(false);
+      expect(payload.data.job.options.deleteConversationAfterResult).toBe(true);
       expect(payload.data.result).toBe("OK");
       expect(payload.data.agentInstruction).toContain("data.result is the primary deliverable");
       expect(payload.data.agentInstruction).toContain("preserve Pro's prose language");
@@ -373,7 +394,7 @@ describe("robot-mode CLI", () => {
       expect(requestBody.model).toBe("gpt-5-5-pro");
       expect(requestBody.thinking_effort).toBe("extended");
       expect(requestBody.verbosity).toBe("low");
-      expect(requestBody.history_and_training_disabled).toBe(true);
+      expect(requestBody.history_and_training_disabled).toBeUndefined();
       expect(requestBody).not.toHaveProperty("text");
     });
   });
