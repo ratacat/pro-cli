@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "bun:test";
-import { listModels } from "../src/models";
+import { canonicalModelId, listModels } from "../src/models";
 
 const originalFetch = globalThis.fetch;
 
@@ -32,22 +32,30 @@ async function withTokenFile<T>(fn: (path: string) => Promise<T>): Promise<T> {
 }
 
 describe("model discovery", () => {
+  test("canonicalizes GPT-6 Pro aliases to the new default", () => {
+    expect(canonicalModelId("pro")).toBe("gpt-6-pro");
+    expect(canonicalModelId("6-pro")).toBe("gpt-6-pro");
+    expect(canonicalModelId("gpt 6.0 pro")).toBe("gpt-6-pro");
+  });
+
   test("falls back to static models when no session token is available", async () => {
     const result = await listModels({ sessionTokenPath: "/tmp/pro-query-missing-token.json" });
 
     expect(result.source).toBe("static");
     expect(result.warning).toContain("No captured ChatGPT session token");
-    expect(result.defaultModel).toBe("gpt-5-6-pro");
+    expect(result.defaultModel).toBe("gpt-6-pro");
     expect(result.models.map((model) => model.id)).not.toContain("auto");
+    expect(result.models.map((model) => model.id)).toContain("gpt-6-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-6-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-5-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-4-5");
-    expect(result.models.find((model) => model.id === "gpt-5-6-pro")).toMatchObject({
-      label: "GPT-5.6 Pro",
+    expect(result.models.find((model) => model.id === "gpt-6-pro")).toMatchObject({
+      label: "GPT-6 Pro",
       reasoningLevels: ["standard"],
       reasoningType: "pro",
       default: true,
     });
+    expect(result.models.find((model) => model.id === "gpt-5-6-pro")?.default).toBeUndefined();
     expect(result.models.find((model) => model.id === "research")).toMatchObject({
       label: "Deep Research",
       reasoningLevels: ["standard", "extended"],
@@ -96,7 +104,7 @@ describe("model discovery", () => {
       expect(authHeader).toStartWith("Bearer ");
       expect(accountHeader).toBe("acct_test");
       expect(result.source).toBe("live");
-      expect(result.defaultModel).toBe("gpt-5-6-pro");
+      expect(result.defaultModel).toBe("gpt-6-pro");
       expect(result.chatgptDefaultModel).toBe("gpt-5-5");
       expect(result.modelPickerVersion).toBe(2);
       expect(result.models[0]).toMatchObject({

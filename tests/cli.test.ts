@@ -226,7 +226,7 @@ describe("robot-mode CLI", () => {
       const created = JSON.parse(createdResult.stdout);
       const jobId = created.data.job.id;
       expect(created.data.job.status).toBe("queued");
-      expect(created.data.job.model).toBe("gpt-5-6-pro");
+      expect(created.data.job.model).toBe("gpt-6-pro");
       expect(created.data.job.reasoning).toBe("standard");
       expect(created.data.daemon.started).toBe(false);
       expect(created.data.job.prompt).toBe("");
@@ -384,7 +384,7 @@ describe("robot-mode CLI", () => {
       installFakeCdp(conversationStream("OK"), () => {});
 
       const result = await run(
-        ["ask", "hello", "--model", "gpt-5-6-pro", "--reasoning", "extended", "--json"],
+        ["ask", "hello", "--model", "gpt-6-pro", "--reasoning", "extended", "--json"],
         { tty: true, home },
       );
 
@@ -412,7 +412,7 @@ describe("robot-mode CLI", () => {
 
       expect(result.code).toBe(0);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("gpt-5-6-pro");
+      expect(requestBody.model).toBe("gpt-6-pro");
       expect(requestBody.thinking_effort).toBe("standard");
     });
   });
@@ -468,7 +468,7 @@ describe("robot-mode CLI", () => {
 
       expect(result.code).toBe(0);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("gpt-5-6-pro");
+      expect(requestBody.model).toBe("gpt-6-pro");
       expect(requestBody.thinking_effort).toBe("standard");
     });
   });

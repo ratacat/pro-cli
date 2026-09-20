@@ -197,7 +197,7 @@ describe("ChatGPT transport", () => {
         expect(tasks).toEqual(["image:conversation-image"]);
 
         const requestBody = requestBodyFromExpression(calls[0]);
-        expect(requestBody.model).toBe("gpt-5-6-pro");
+        expect(requestBody.model).toBe("gpt-6-pro");
         const patchCall = calls.find((call) => call.includes("is_visible"));
         expect(patchCall).toBeDefined();
         expect(requestBody.history_and_training_disabled).toBeUndefined();

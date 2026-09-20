@@ -116,7 +116,7 @@ Models and defaults:
 ```sh
 pro-cli models --json
 pro-cli config get --json
-pro-cli config set model gpt-5-6-pro --json
+pro-cli config set model gpt-6-pro --json
 pro-cli config set reasoning extended --json
 ```
 
@@ -280,7 +280,7 @@ pro-cli ask "follow up" --save --conversation <conversation-id> --parent <messag
 
 ## Thinking Modes
 
-By default, `pro-cli` sends `--model gpt-5-6-pro --reasoning standard`. The request includes `thinking_effort=standard`, so it uses the Pro model rather than ChatGPT web's default picker.
+By default, `pro-cli` sends `--model gpt-6-pro --reasoning standard`. The request includes `thinking_effort=standard`, so it uses the Pro model rather than ChatGPT web's default picker.
 
 For deeper Pro reasoning, use the model that still exposes Extended Pro:
 
@@ -297,7 +297,7 @@ min
 max
 ```
 
-GPT-5.6 Pro exposes only `standard` (live catalog, 2026-07-29): the web picker has no Extended toggle for it, and GPT-5.5 Pro is now listed under "Legacy models" as the only Pro with `extended`. The backend mirrors any `thinking_effort` string back for `gpt-5-6-pro` (even `max`) without changing observable behavior, so pro-cli rejects `--reasoning` values the catalog does not list for the model and falls back to `standard` when a configured default is unsupported. Thinking models may expose `min`, `standard`, `extended`, and `max`. For explicit model ids, use an effort shown by:
+The static fallback advertises `gpt-6-pro` with `standard` reasoning until a live model catalog is available. Existing model ids, including `gpt-5-6-pro`, remain selectable for pinned jobs and saved configurations. GPT-5.5 Pro remains the documented fallback for Extended Pro reasoning. For explicit model ids, use an effort shown by:
 
 ```sh
 pro-cli models --json

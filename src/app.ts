@@ -523,7 +523,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         }
         if (subcommand === "set") {
           const [key, value] = rest;
-          if (!key || !value) throw invalidArgs("Missing config key/value.", ["Use pro-cli config set model gpt-5-5-pro."]);
+          if (!key || !value) throw invalidArgs("Missing config key/value.", ["Use pro-cli config set model gpt-6-pro."]);
           const next = { ...config };
           if (key === "model") next.defaultModel = resolveModel(value);
           else if (key === "reasoning") next.defaultReasoning = resolveReasoning(value);
@@ -1013,7 +1013,7 @@ function resolveModel(model: string): string {
   const value = canonicalModelId(model);
   if (!value || value === "auto") {
     throw invalidArgs("Invalid --model.", [
-      "Use a concrete model id such as gpt-5-5-pro, gpt-4-5, research, or image; or run pro-cli models --json.",
+      "Use a concrete model id such as gpt-6-pro, gpt-4-5, research, or image; or run pro-cli models --json.",
     ]);
   }
   return value;

@@ -2775,7 +2775,7 @@ function normalizeModel(model: string): string {
   if (value === "auto") {
     throw new ProError("INVALID_MODEL", "The model auto is not supported.", {
       exitCode: EXIT.invalidArgs,
-      suggestions: ["Use a concrete model id such as gpt-5-5-pro, gpt-4-5, or research."],
+      suggestions: ["Use a concrete model id such as gpt-6-pro, gpt-4-5, or research."],
     });
   }
   return value;
