@@ -48,7 +48,11 @@ const MODEL_ID_ALIASES: Record<string, string> = {
   "5.6-pro": "gpt-5-6-pro",
   "gpt-5.6-pro": "gpt-5-6-pro",
   "gpt 5.6 pro": "gpt-5-6-pro",
-  "pro": "gpt-5-6-pro",
+  "6-pro": "gpt-6-pro",
+  "gpt-6.0-pro": "gpt-6-pro",
+  "gpt 6 pro": "gpt-6-pro",
+  "gpt 6.0 pro": "gpt-6-pro",
+  "pro": "gpt-6-pro",
   "5.6-thinking": "gpt-5-6-thinking",
   "gpt-5.6-thinking": "gpt-5-6-thinking",
   "gpt 5.6 thinking": "gpt-5-6-thinking",
@@ -69,11 +73,18 @@ const MODEL_ID_ALIASES: Record<string, string> = {
 
 const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
   {
+    id: "gpt-6-pro",
+    label: "GPT-6 Pro",
+    source: "static-unverified",
+    reasoningLevels: ["standard"],
+    default: true,
+    reasoningType: "pro",
+  },
+  {
     id: "gpt-5-6-pro",
     label: "GPT-5.6 Pro",
     source: "static-unverified",
     reasoningLevels: ["standard"],
-    default: true,
     reasoningType: "pro",
   },
   {

@@ -47,7 +47,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     if (!raw) {
       throw new ProError("INVALID_ARGS", "Empty flag is not valid.", {
         exitCode: EXIT.invalidArgs,
-        suggestions: ["Use flags like --json or --model gpt-5-5-pro."],
+        suggestions: ["Use flags like --json or --model gpt-6-pro."],
       });
     }
 
@@ -55,7 +55,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     if (!name) {
       throw new ProError("INVALID_ARGS", `Invalid flag ${token}.`, {
         exitCode: EXIT.invalidArgs,
-        suggestions: ["Use flags like --json or --model gpt-5-5-pro."],
+        suggestions: ["Use flags like --json or --model gpt-6-pro."],
       });
     }
 

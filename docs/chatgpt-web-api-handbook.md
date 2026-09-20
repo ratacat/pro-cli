@@ -317,7 +317,7 @@ gpt-5.6-terra-wm   GPT-5.6 Terra     reasoning_type=reasoning  min/standard/exte
 gpt-5.6-luna-wm    GPT-5.6 Luna      reasoning_type=reasoning  min/standard/extended/max
 ```
 
-`gpt-5-6-pro` advertises only `standard` thinking effort; `gpt-5-5-pro` remains available with `standard` and `extended` ("Extended Pro") but its picker category is tagged `subcategory: "Legacy models"`. `pro-cli` now defaults to `gpt-5-6-pro`.
+`gpt-5-6-pro` advertises only `standard` thinking effort; `gpt-5-5-pro` remains available with `standard` and `extended` ("Extended Pro") but its picker category is tagged `subcategory: "Legacy models"`. At the time of this observation, `pro-cli` defaulted to `gpt-5-6-pro`.
 
 ### Extended Reasoning Probe (gpt-5-6-pro)
 
@@ -337,6 +337,10 @@ Conclusions:
 - No stream field discriminates applied effort: no paragen/parallel/sample-count markers, `auto_switcher_race_winner: null`, `did_auto_switch_to_reasoning: false` in every run.
 - Reasoning durations on a shared moderately hard prompt were indistinguishable (gpt-5-6-pro standard 32s, extended 19s, gpt-5-5-pro extended 29s), so duration evidence is inconclusive at this prompt difficulty.
 - Product-side the answer is clear: the web picker offers no Extended toggle for GPT-5.6 Pro, so "extended on 5.6 Pro" does not exist as a product feature. Treat unlisted efforts as no-ops. `pro-cli` therefore rejects `--reasoning` values the static catalog does not list for a known model and clamps unsupported configured defaults to `standard`.
+
+### Repository default update (2026-09-09)
+
+The repository default is now `gpt-6-pro` with `standard` reasoning. The static fallback labels that model `static-unverified`; use `pro-cli models --json` with a captured session to confirm whether the current ChatGPT account exposes the model and which thinking efforts it supports. Existing model ids remain available for pinned jobs and saved configurations.
 
 ### Temporary Chats Still Cannot Generate Images
 
