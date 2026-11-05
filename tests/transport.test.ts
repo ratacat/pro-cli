@@ -197,12 +197,79 @@ describe("ChatGPT transport", () => {
         expect(tasks).toEqual(["image:conversation-image"]);
 
         const requestBody = requestBodyFromExpression(calls[0]);
-        expect(requestBody.model).toBe("gpt-5-6-pro");
+        expect(requestBody.model).toBe("gpt-6-pro");
         const patchCall = calls.find((call) => call.includes("is_visible"));
         expect(patchCall).toBeDefined();
         expect(requestBody.history_and_training_disabled).toBeUndefined();
         expect((requestBody.messages as Array<{ content: { parts: string[] } }>)[0].content.parts[0])
           .toContain("Use ChatGPT image generation tools");
+      } finally {
+        await rm(artifactDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("steers Sunburst 2.6 image jobs and saves animated GIF artifacts with .gif extension", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const artifactDir = await mkdtemp(join(tmpdir(), "pro-sunburst-test-"));
+      try {
+        const calls: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, expression: string): Promise<T> => {
+          calls.push(expression);
+          if (expression.includes("is_visible")) {
+            return { ok: true, status: 200 } as T;
+          }
+          if (expression.includes("/backend-api/files/download/")) {
+            return {
+              ok: true,
+              status: 200,
+              contentType: "image/gif",
+              bytes: 9,
+              base64: Buffer.from("gif-bytes").toString("base64"),
+              fileName: "sunburst.gif",
+            } as T;
+          }
+          if (expression.includes("/backend-api/conversation/")) {
+            return {
+              ok: true,
+              status: 200,
+              title: "Sunburst animation",
+              asyncStatus: 4,
+              assets: [
+                {
+                  fileId: "file_sunburst_1",
+                  assetPointer: "sediment://file_sunburst_1",
+                  width: 1254,
+                  height: 1254,
+                  sizeBytes: 9,
+                  title: "Sunburst animation",
+                  genId: "gen_sunburst_1",
+                },
+              ],
+            } as T;
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: imageLaunchStream("conversation-sunburst"),
+          } as T;
+        });
+
+        const sunburstJob = job({ model: "image", reasoning: "standard" });
+        sunburstJob.options.imageVariant = "sunburst";
+        const result = await runChatGptJob(sunburstJob, {
+          sessionTokenPath,
+          pageEvaluator,
+          artifactDir,
+        });
+
+        const parsed = JSON.parse(result) as { images: Array<{ path: string; contentType: string }> };
+        expect(parsed.images[0].path).toEndWith("image-1.gif");
+        expect(parsed.images[0].contentType).toBe("image/gif");
+
+        const requestBody = requestBodyFromExpression(calls[0]);
+        expect((requestBody.messages as Array<{ content: { parts: string[] } }>)[0].content.parts[0])
+          .toContain("Target GPT Image 2.6 Sunburst");
       } finally {
         await rm(artifactDir, { recursive: true, force: true });
       }
@@ -1126,6 +1193,53 @@ describe("ChatGPT transport", () => {
       const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
 
       expect(result).toBe("OK");
+    });
+  });
+
+  test("does not append status replacement strings after bare-v text continuations", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({
+          ok: true,
+          status: 200,
+          body: [
+            'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["I will create"]},"status":"in_progress"}}}',
+            'data: {"p":"/message/content/parts/0","o":"append","v":" the icon"}',
+            'data: {"v":" now."}',
+            'data: {"p":"/message/status","o":"replace","v":"finished_successfully"}',
+            'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"}}}',
+            'data: {"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+            'data: {"type":"message_stream_complete"}',
+            "",
+          ].join("\n\n"),
+        }) as T);
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("I will create the icon now.");
+    });
+  });
+
+  test("replaces commentary preamble text when a final assistant message appends deltas", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({
+          ok: true,
+          status: 200,
+          body: [
+            'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["I will check."]},"status":"in_progress","channel":"commentary"}}}',
+            'data: {"p":"/message/status","o":"replace","v":"finished_successfully"}',
+            'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress","channel":"final"}}}',
+            'data: {"p":"/message/content/parts/0","o":"append","v":"42"}',
+            'data: {"p":"/message/status","o":"replace","v":"finished_successfully"}',
+            'data: {"type":"message_stream_complete"}',
+            "",
+          ].join("\n\n"),
+        }) as T);
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("42");
     });
   });
 

@@ -33,6 +33,7 @@ import { JobStore, redactJob } from "./jobs";
 import { fetchAccountSummary } from "./limits";
 import {
   canonicalModelId,
+  imageVariantForModel,
   listModels,
   modelRequiresSavedConversation,
   modelUsesThinkingEffort,
@@ -46,7 +47,7 @@ import { writeError, writeSuccess } from "./output";
 import { updateProCli } from "./update";
 
 const HELP_TEXT =
-  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nconversations list|archive|delete: clean saved chats\nupdate: fast-forward install\nImages: --model image on ask/job create; saved conversation, auto-deleted after download unless --keep-conversation; edit via --attach <image>; files: ~/.pro-cli/images/<jobId>/.\nTimeouts: Deep Research defaults to 1800000ms and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting.\nUse --json for agents.";
+  "pro-cli: ChatGPT Pro CLI\nask: direct blocking query, no job DB\nodds: probability of YES, integer 0-100\nlimits: plan + observed counters\njob create --wait: durable blocking query\njob wait: waits until done\nconversations list|archive|delete: clean saved chats\nupdate: fast-forward install\nImages: --model image|sunburst|flare on ask/job create; saved conversation, auto-deleted after download unless --keep-conversation; edit via --attach <image>; files: ~/.pro-cli/images/<jobId>/.\nTimeouts: Deep Research defaults to 1800000ms and rejects smaller values. --wait-timeout/--soft-timeout only control local daemon waiting.\nUse --json for agents.";
 const DEFAULT_RESEARCH_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 10 * 60_000;
 const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
@@ -213,11 +214,12 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
       }
       case "ask": {
         const prompt = await promptFromArgs([subcommand, ...rest].filter(Boolean), io.cwd);
-        const askModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
-        const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
+        const rawAskModel = flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL;
+        const askModel = resolveModel(rawAskModel);
         const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
-        applyModelConversationRequirements(askOptions, parsed.flags, askModel);
+        applyModelConversationRequirements(askOptions, parsed.flags, askModel, rawAskModel);
         applyModelTimeoutDefaults(askOptions, parsed.flags, askModel);
+        const askReasoning = await resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning, paths.sessionTokenPath);
         const schemaRaw = flagString(parsed.flags, "schema");
         const formatHint = flagString(parsed.flags, "format");
         if (schemaRaw && formatHint) {
@@ -295,7 +297,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           question,
           context,
           model: oddsModel,
-          reasoning: resolveRequestReasoning(oddsModel, parsed.flags, config.defaultReasoning),
+          reasoning: await resolveRequestReasoning(oddsModel, parsed.flags, config.defaultReasoning, paths.sessionTokenPath),
           samples,
           aggregate,
           allowFifty,
@@ -346,14 +348,15 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             ]);
           }
           const userPrompt = await promptFromArgs(rest, io.cwd);
-          const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
+          const rawJobModel = flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL;
+          const jobModel = resolveModel(rawJobModel);
           const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
-          applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
+          applyModelConversationRequirements(jobOptions, parsed.flags, jobModel, rawJobModel);
           applyModelTimeoutDefaults(jobOptions, parsed.flags, jobModel);
           const input = {
             prompt: userPrompt,
             model: jobModel,
-            reasoning: resolveRequestReasoning(jobModel, parsed.flags, config.defaultReasoning),
+            reasoning: await resolveRequestReasoning(jobModel, parsed.flags, config.defaultReasoning, paths.sessionTokenPath),
             options: jobOptions,
           };
           if (!flagBoolean(parsed.flags, "no-start")) {
@@ -523,7 +526,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         }
         if (subcommand === "set") {
           const [key, value] = rest;
-          if (!key || !value) throw invalidArgs("Missing config key/value.", ["Use pro-cli config set model gpt-5-5-pro."]);
+          if (!key || !value) throw invalidArgs("Missing config key/value.", ["Use pro-cli config set model gpt-6-pro."]);
           const next = { ...config };
           if (key === "model") next.defaultModel = resolveModel(value);
           else if (key === "reasoning") next.defaultReasoning = resolveReasoning(value);
@@ -934,13 +937,19 @@ function resolveReasoning(reasoning: string): string {
   throw invalidArgs("Invalid --reasoning.", [`Allowed values: ${REASONING_LEVELS.join(", ")}.`]);
 }
 
-function resolveRequestReasoning(
+async function resolveRequestReasoning(
   model: string,
   flags: Map<string, string | boolean | string[]>,
-  configuredReasoning?: string,
-): string {
+  configuredReasoning: string | undefined,
+  sessionTokenPath: string,
+): Promise<string> {
   const explicitReasoning = flagString(flags, "reasoning");
-  if (!modelUsesThinkingEffort(model)) {
+  const catalog = await listModels({ sessionTokenPath });
+  const capability = catalog.models.find((entry) => canonicalModelId(entry.id) === canonicalModelId(model));
+  const usesThinkingEffort = capability
+    ? capability.reasoningType !== "none" && capability.reasoningLevels.length > 0
+    : modelUsesThinkingEffort(model);
+  if (!usesThinkingEffort) {
     if (explicitReasoning !== undefined) {
       throw invalidArgs(`Model ${model} does not support --reasoning.`, [
         `Omit --reasoning for ${model}; ChatGPT's model catalog exposes no thinking_effort levels for it.`,
@@ -949,7 +958,7 @@ function resolveRequestReasoning(
     return NO_REASONING;
   }
   const resolved = resolveReasoning(explicitReasoning ?? configuredReasoning ?? DEFAULT_REASONING);
-  const supportedLevels = reasoningLevelsForModel(model);
+  const supportedLevels = capability?.reasoningLevels ?? reasoningLevelsForModel(model);
   if (supportedLevels && supportedLevels.length > 0 && !supportedLevels.includes(resolved)) {
     const canonical = canonicalModelId(model);
     if (explicitReasoning !== undefined) {
@@ -969,7 +978,10 @@ function applyModelConversationRequirements(
   options: Record<string, unknown>,
   flags: Map<string, string | boolean | string[]>,
   model: string,
+  rawModel?: string,
 ): void {
+  const imageVariant = imageVariantForModel(rawModel ?? model);
+  if (imageVariant) options.imageVariant = imageVariant;
   if (!modelRequiresSavedConversation(model)) return;
   const label = canonicalModelId(model) === "image" ? "Image generation" : "Deep Research";
   const store = readBooleanFlag(flags, "store");
@@ -1013,7 +1025,7 @@ function resolveModel(model: string): string {
   const value = canonicalModelId(model);
   if (!value || value === "auto") {
     throw invalidArgs("Invalid --model.", [
-      "Use a concrete model id such as gpt-5-5-pro, gpt-4-5, research, or image; or run pro-cli models --json.",
+      "Use a concrete model id such as gpt-6-pro, gpt-6-astra-wm, research, or image; or run pro-cli models --json.",
     ]);
   }
   return value;

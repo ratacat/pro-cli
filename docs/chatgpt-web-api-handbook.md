@@ -381,6 +381,90 @@ GET   /backend-api/conversations?offset=&limit=&order=updated       sidebar list
 
 These work with plain bearer-token fetches outside the browser (no sentinel required). `pro-cli` deletes image conversations after downloading results and exposes `conversations list|archive|delete`.
 
+## 2026-09-05 Findings
+
+The authenticated account's live `GET /backend-api/models` catalog includes
+`gpt-6-pro` (GPT-6 Pro, `reasoning_type: pro`, 410000 max tokens,
+`thinking_efforts: ["standard"]`) and `gpt-6-astra-wm` (GPT-6 Astra,
+262144 max tokens, min/standard/extended/max). GPT-5.6 Pro and GPT-5.5 Pro
+remain listed. These are browser slugs, distinct from public API model IDs.
+
+A temporary `ask --model gpt-6-pro --reasoning standard` completed with the
+expected answer. Existing session, conversation prepare/submission, and SSE
+handling worked without changing authentication headers or request shapes.
+`doctor`, live model discovery, account/limits lookup, and saved conversation
+listing also succeeded. The static default and `pro` alias still selected
+GPT-5.6 Pro before this update; static-only validation also missed newly listed
+models' thinking capabilities. Request validation should use the live catalog
+when available and retain explicitly unverified static fallback data offline.
+
+The live catalog also returns `thinking_efforts: []` and
+`configurable_thinking_effort: false` for automatic models, some mini models,
+and `o3-pro`. The old parser expanded those empty arrays into every thinking
+level. The updated listing preserves an empty list, and requests omit the
+effort field and reject explicit `--reasoning` for these models.
+
+The updated default was also tested through a durable saved-conversation
+continuation. The final assistant message reported `model_slug: "gpt-6-pro"`,
+`resolved_model_slug: "gpt-6-pro"`, `thinking_effort: "standard"`,
+`status: "finished_successfully"`, and `end_turn: true`.
+
+Other live checks completed:
+
+- Image generation through GPT-6 Pro downloaded a PNG and automatically deleted
+  its saved test conversation. The image pseudo-model now advertises only
+  `standard`, matching its underlying Pro model.
+- Uploading that PNG with `--attach` and `--schema` returned the correct color
+  and shape as JSON on the first attempt, in a temporary conversation.
+- `odds --model astra` returned a valid probability from `gpt-6-astra-wm`.
+- A durable Deep Research job launched, persisted its task ID, polled to
+  completion, and exposed the report through `job result`. The existing
+  `gpt-5-5` connector router still works and remains unchanged.
+- `job create`, `job wait`, `job status`, `job result`, and daemon restart worked.
+  The research test conversation was reused for the continuation test, then
+  archived and deleted successfully through the existing PATCH endpoints.
+
+Failure behavior (expired auth, 431 recovery, throttling, incomplete streams,
+retry, and local cancellation) is covered by automated tests; this refresh did
+not deliberately expire the real login or induce throttling/network failures.
+Cancellation is local only: the daemon marks the job cancelled and prevents
+late completion from changing its state, but sends no backend stop request.
+  HTTP/SSE compatibility here is a point-in-time observation, not an upstream
+API guarantee. No raw cookies, tokens, or streams were printed or committed.
+
+## 2026-11-05 Findings
+
+Validated live against the authenticated session on November 5, 2026.
+
+### GPT Image 2.6 (Sunburst and Flare)
+
+In the OpenAI API, GPT Image 2.6 exposes two model slugs: `gpt-image-2.6-sunburst` (high-fidelity layouts, dense text, and multi-turn edit consistency) and `gpt-image-2.6-flare` (rapid draft generation). In the ChatGPT web app, `GET /backend-api/models` does not list a standalone image model slug. Instead, the active conversation model (`gpt-6-pro`) invokes the image generation tool (`recipient: "t2uay3k.sj1i4kz"`), which routes between Sunburst and Flare from prompt context and returns `sediment://file_...` `image_asset_pointer` parts.
+
+Live image generation responses now include GPT Image 2.6 metadata on `image_asset_pointer.metadata` and the tool message `metadata.image_gen_Metadata`:
+
+- `dalle.prompt` and `dalle.edit_op`
+- `generation.spritesheet`, `generation.animation`, `generation.selected_speed`, `generation.gif_speed_variants`, and `generation.watermarked_gif_speed_variants`
+- `generation.ghostrider: { status: "final" }`
+- `image_gen_async: true` and `image_gen_model_name: null`
+
+`pro-cli` maps `--model sunburst`, `--model "sunburst 2.6"`, `--model gpt-image-2.6-sunburst`, `--model flare`, `--model "flare 2.6"`, and `--model gpt-image-2.6-flare` to the `image` workflow, records `options.imageVariant` (`"sunburst"` or `"flare"`), steers the image tool prompt toward that variant, and maps `image/gif` and `image/svg+xml` downloads to `.gif` and `.svg`.
+
+### Model Catalog Additions
+
+`GET /backend-api/models` now includes:
+
+```txt
+gpt-6.1-sol-wm     GPT-6.1 Sol       reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+gpt-6.1-terra-wm   GPT-6.1 Terra     reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+gpt-6-sol-wm       GPT-6 Sol         reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+gpt-6-luna-wm      GPT-6 Luna        reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+gpt-6-thinking     GPT-6 Thinking    reasoning_type=reasoning  min/standard/extended/max  max_tokens=262144
+```
+
+### SSE Delta Continuation and Multi-Message Turn Handling
+
+Live `gpt-6-pro` tool turns emit a commentary preamble message (`channel: "commentary"`) streamed with bare-`v` text continuation frames (`{"v": " navy."}`) followed immediately by `{"p": "/message/status", "o": "replace", "v": "finished_successfully"}`. Checking `typeof event.v === "string"` without requiring `event.o === undefined && event.p === undefined` caused `"finished_successfully"` to append onto the assistant text. `readPatchAppendText` in `src/transport.ts` now restricts bare-`v` text continuation to frames where both `o` and `p` are `undefined`, and resets accumulated stream text when a new assistant message snapshot starts on the `"final"` channel.
+
 ## Exploration Playbook
 
 Use CDP network tracing and keep each experiment small.

@@ -176,7 +176,7 @@ interface ProbeOptions {
 function parseArgs(args: string[]): ProbeOptions {
   const parsed: ProbeOptions = {
     cdpBase: "http://127.0.0.1:9222",
-    model: "gpt-5-5-pro",
+    model: "gpt-6-pro",
     reasoning: "standard",
     save: false,
     timeoutMs: 10 * 60_000,
@@ -390,6 +390,8 @@ function extensionForContentType(contentType: string): string {
   if (contentType.includes("png")) return "png";
   if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
   if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("gif")) return "gif";
+  if (contentType.includes("svg")) return "svg";
   return "bin";
 }
 

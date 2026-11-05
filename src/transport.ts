@@ -6,7 +6,7 @@ import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, LimitsObservation } from "./jobs";
-import { canonicalModelId, modelUsesThinkingEffort } from "./models";
+import { canonicalModelId, imageVariantForModel, modelUsesThinkingEffort, NO_REASONING } from "./models";
 import { isTokenFresh, loadSessionToken } from "./session-token";
 
 const CHATGPT_CONVERSATION_ENDPOINT = "https://chatgpt.com/backend-api/f/conversation";
@@ -1021,7 +1021,8 @@ function buildRequestBody(job: JobRecord, attachments: UploadedAttachment[] = []
   const isImage = requestedModel === "image";
   const prompt = isResearch ? buildResearchPrompt(job) : isImage ? buildImagePrompt(job) : buildConversationPrompt(job);
   const model = isResearch ? DEEP_RESEARCH_ROUTER_MODEL : isImage ? DEFAULT_MODEL : normalizeModel(job.model);
-  const thinkingEffort = !isResearch && modelUsesThinkingEffort(model) ? normalizeReasoning(job.reasoning) : undefined;
+  const thinkingEffort = !isResearch && job.reasoning !== NO_REASONING && modelUsesThinkingEffort(model)
+    ? normalizeReasoning(job.reasoning) : undefined;
   const conversationId = stringOption(job.options.conversationId);
   const parentMessageId = stringOption(job.options.parentMessageId) ?? "client-created-root";
   const temporary = booleanOption(job.options.temporary, !conversationId);
@@ -1127,10 +1128,18 @@ function buildResearchPrompt(job: JobRecord): string {
 
 function buildImagePrompt(job: JobRecord): string {
   const prompt = job.prompt.trim();
+  const variant = imageVariantForModel(stringOption(job.options.imageVariant) ?? job.model);
+  const variantInstructions =
+    variant === "sunburst"
+      ? "Target GPT Image 2.6 Sunburst: prioritize high-fidelity detail, complex layout accuracy, crisp text rendering, and strict visual consistency across edits."
+      : variant === "flare"
+        ? "Target GPT Image 2.6 Flare: prioritize fast draft generation and rapid visual iteration."
+        : undefined;
   const imageInstructions =
     "Use ChatGPT image generation tools to create image(s) from the user's prompt. Do not answer with only a revised prompt. After generation, keep any text brief.";
   const instructions = [
     imageInstructions,
+    variantInstructions,
     stringOption(job.options.instructions),
   ].filter((part): part is string => Boolean(part && part.trim())).join("\n\n");
   return `${instructions.trim()}\n\n${prompt}`;
@@ -1175,7 +1184,11 @@ function readResponse(
   let deepResearchWidget: ResearchTask | null = null;
   let conversationId: string | null = null;
   let completed = false;
-  const state: ResponseParseState = { acceptsTextContinuation: false, lastAppendText: null };
+  const state: ResponseParseState = {
+    acceptsTextContinuation: false,
+    lastAppendText: null,
+    pendingMessageReset: false,
+  };
 
   let boundary = buffer.indexOf("\n\n");
   while (boundary !== -1) {
@@ -1184,7 +1197,7 @@ function readResponse(
     const event = parseSseFrame(frame);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
-      completedText = mergeStreamText(completedText, parsed.text, parsed.append);
+      completedText = mergeStreamText(completedText, parsed.text, parsed.append, parsed.reset);
     }
     if (onLimits) {
       const observations = extractLimitsProgress(event);
@@ -1201,7 +1214,7 @@ function readResponse(
     const event = parseSseFrame(buffer);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
-      completedText = mergeStreamText(completedText, parsed.text, parsed.append);
+      completedText = mergeStreamText(completedText, parsed.text, parsed.append, parsed.reset);
     }
     if (onLimits) {
       const observations = extractLimitsProgress(event);
@@ -1748,6 +1761,8 @@ function imageExtension(contentType: string): string {
   if (contentType.includes("png")) return "png";
   if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
   if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("gif")) return "gif";
+  if (contentType.includes("svg")) return "svg";
   return "bin";
 }
 
@@ -2609,9 +2624,11 @@ function isResearchTaskFailed(status: string): boolean {
 interface ResponseParseState {
   acceptsTextContinuation: boolean;
   lastAppendText: string | null;
+  pendingMessageReset: boolean;
 }
 
-function mergeStreamText(current: string | null, next: string, append: boolean): string {
+function mergeStreamText(current: string | null, next: string, append: boolean, reset = false): string {
+  if (reset) return next;
   if (append) {
     if (current && (current === next || current.endsWith(next))) return current;
     return `${current ?? ""}${next}`;
@@ -2659,6 +2676,7 @@ function readConversationEvent(event: unknown, state: ResponseParseState): {
   text: string | null;
   completed: boolean;
   append: boolean;
+  reset?: boolean;
 } {
   if (!isRecord(event)) return { text: null, completed: false, append: false };
   if (event.type === "error") {
@@ -2669,13 +2687,21 @@ function readConversationEvent(event: unknown, state: ResponseParseState): {
   }
   const patchText = readPatchAppendText(event, state);
   if (patchText !== null) {
+    const reset = state.pendingMessageReset && patchText.length > 0;
+    if (reset) state.pendingMessageReset = false;
     return {
       text: patchText,
-      append: true,
+      append: !reset,
+      reset,
       completed: event.type === "done" || event.type === "message_stream_complete",
     };
   }
   const messageText = readConversationMessageText(event);
+  if (messageText === "") {
+    state.pendingMessageReset = true;
+  } else if (messageText !== null) {
+    state.pendingMessageReset = false;
+  }
   return {
     text: messageText,
     append: false,
@@ -2716,7 +2742,7 @@ function readPatchAppendText(event: Record<string, unknown>, state: ResponsePars
     state.acceptsTextContinuation = true;
     return readNewAppendText(event.v, state);
   }
-  if (typeof event.v === "string" && state.acceptsTextContinuation) {
+  if (typeof event.v === "string" && event.o === undefined && event.p === undefined && state.acceptsTextContinuation) {
     return readNewAppendText(event.v, state);
   }
   state.acceptsTextContinuation = false;

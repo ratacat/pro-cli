@@ -10,6 +10,8 @@ Agent native CLI for querying ChatGPT Pro and Deep Research through your own log
 
 `pro-cli` is built for legal ChatGPT subscribers using their own session. It does not bypass authentication, subscriptions, rate limits, access controls, or account restrictions.
 
+For using browser Pro as the model behind a coding agent, see the [OMP harness feasibility findings](docs/pro-coding-harness-feasibility.md), including a tested prototype and the remaining integration work.
+
 ## Install
 
 Requires Bun. `pro-cli` is a Bun/TypeScript CLI with the binary name `pro-cli`. It has been tested on macOS; Windows may need install or Chrome auth command adjustment.
@@ -116,8 +118,8 @@ Models and defaults:
 ```sh
 pro-cli models --json
 pro-cli config get --json
-pro-cli config set model gpt-5-6-pro --json
-pro-cli config set reasoning extended --json
+pro-cli config set model gpt-6-pro --json
+pro-cli config set reasoning standard --json
 ```
 
 Async jobs:
@@ -125,7 +127,7 @@ Async jobs:
 ```sh
 pro-cli job create @prompt.md --json
 pro-cli job create @prompt.md --wait --json
-pro-cli job create @prompt.md --reasoning extended --json
+pro-cli job create @prompt.md --model gpt-5-5-pro --reasoning extended --json
 pro-cli job create @prompt.md --condensed-response 500 --json
 pro-cli job create "Create one square icon of a red kite on white" --model image --wait --json
 pro-cli job wait <job-id> --json
@@ -136,6 +138,8 @@ pro-cli job list --limit 20 --json
 ```
 
 `job wait` without a timeout waits until the job succeeds, fails, or is cancelled. Long prompts and `--reasoning extended` can run for several minutes. Use `--soft-timeout <ms>` when an agent needs to poll without a nonzero exit. Use `--wait-timeout <ms>` only when a timeout should fail the local command.
+
+`job cancel` marks the local job cancelled and prevents a later result from replacing that state. It does not send an upstream stop request; an already submitted ChatGPT turn may continue running.
 
 Daemon:
 
@@ -149,7 +153,7 @@ Direct ask:
 
 ```sh
 pro-cli ask @prompt.md --json
-pro-cli ask @prompt.md --reasoning extended --json
+pro-cli ask @prompt.md --model gpt-5-5-pro --reasoning extended --json
 pro-cli ask @prompt.md --condensed_response=500 --json
 ```
 
@@ -161,12 +165,17 @@ JSON responses that include full Pro text also include `agentInstruction` and `r
 
 ## Image Generation
 
-Use `--model image` to create images through the logged-in ChatGPT web session:
+Use `--model image`, `--model "sunburst 2.6"`, or `--model flare` to create images through the logged-in ChatGPT web session:
 
 ```sh
 pro-cli job create "Create one square flat vector icon of a blue paper boat on white, no text" \
   --model image --wait --json
+
+pro-cli ask "Create a detailed architectural poster with legible typography" \
+  --model "sunburst 2.6" --json
 ```
+
+`--model sunburst`, `--model "sunburst 2.6"`, and `--model gpt-image-2.6-sunburst` steer the ChatGPT image tool toward the GPT Image 2.6 Sunburst variant for high-fidelity output, complex layouts, dense text, and multi-turn edit consistency. `--model flare`, `--model "flare 2.6"`, and `--model gpt-image-2.6-flare` steer the image tool toward the GPT Image 2.6 Flare variant for fast draft generation.
 
 Image generation is async and uses a saved ChatGPT conversation. Temporary chats cannot create images in ChatGPT (re-verified 2026-07-29: the model reports the image tool is unavailable in temporary chats), so `--model image` rejects `--temporary` and `--store false`.
 
@@ -178,7 +187,7 @@ Generated files are downloaded to:
 ~/.pro-cli/images/<job-id>/image-1.png
 ```
 
-The job result is a JSON string with `type: "image_generation"`, the ChatGPT `conversationId`, `conversationDeleted`, and an `images` array containing local `path`, `contentType`, `bytes`, `width`, `height`, `title`, and source file ids.
+Downloaded extensions follow the upstream content type (`png`, `jpg`, `webp`, `gif`, or `svg`). The job result is a JSON string with `type: "image_generation"`, the ChatGPT `conversationId`, `conversationDeleted`, and an `images` array containing local `path`, `contentType`, `bytes`, `width`, `height`, `title`, and source file ids.
 
 Image jobs default to a 10-minute request timeout. Increase it for complex generations:
 
@@ -280,7 +289,7 @@ pro-cli ask "follow up" --save --conversation <conversation-id> --parent <messag
 
 ## Thinking Modes
 
-By default, `pro-cli` sends `--model gpt-5-6-pro --reasoning standard`. The request includes `thinking_effort=standard`, so it uses the Pro model rather than ChatGPT web's default picker.
+By default, `pro-cli` sends `--model gpt-6-pro --reasoning standard`. `--model pro`, `--model 6-pro`, and `--model "GPT 6 Pro"` select the same browser model. `--model astra` and `--model gpt-6-astra` select `gpt-6-astra-wm`. An explicitly configured model continues to take precedence over the built-in default.
 
 For deeper Pro reasoning, use the model that still exposes Extended Pro:
 
@@ -297,7 +306,7 @@ min
 max
 ```
 
-GPT-5.6 Pro exposes only `standard` (live catalog, 2026-07-29): the web picker has no Extended toggle for it, and GPT-5.5 Pro is now listed under "Legacy models" as the only Pro with `extended`. The backend mirrors any `thinking_effort` string back for `gpt-5-6-pro` (even `max`) without changing observable behavior, so pro-cli rejects `--reasoning` values the catalog does not list for the model and falls back to `standard` when a configured default is unsupported. Thinking models may expose `min`, `standard`, `extended`, and `max`. For explicit model ids, use an effort shown by:
+GPT-6 Pro and GPT-5.6 Pro expose only `standard` (live catalog, 2026-09-05). GPT-5.5 Pro still exposes `extended`. Requests consult the live catalog for thinking capabilities, with a bounded timeout and an explicitly unverified static fallback when discovery is unavailable. Unsupported explicit efforts are rejected; unsupported configured defaults fall back to a supported level. Models without configurable effort omit `thinking_effort`; this does not mean those models cannot reason. GPT-6 Astra and other thinking models may expose `min`, `standard`, `extended`, and `max`. For explicit model ids, use an effort shown by:
 
 ```sh
 pro-cli models --json

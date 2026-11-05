@@ -38,6 +38,23 @@ interface LiveModel {
   enabled_tools?: unknown;
 }
 
+export type ImageVariant = "sunburst" | "flare";
+
+const IMAGE_VARIANT_BY_ALIAS: Record<string, ImageVariant> = {
+  "sunburst": "sunburst",
+  "sunburst 2.6": "sunburst",
+  "sunburst-2.6": "sunburst",
+  "sunburst_2.6": "sunburst",
+  "gpt-image-2.6-sunburst": "sunburst",
+  "gpt image 2.6 sunburst": "sunburst",
+  "flare": "flare",
+  "flare 2.6": "flare",
+  "flare-2.6": "flare",
+  "flare_2.6": "flare",
+  "gpt-image-2.6-flare": "flare",
+  "gpt image 2.6 flare": "flare",
+};
+
 const MODEL_ID_ALIASES: Record<string, string> = {
   "4.5": "gpt-4-5",
   "gpt 4.5": "gpt-4-5",
@@ -48,7 +65,26 @@ const MODEL_ID_ALIASES: Record<string, string> = {
   "5.6-pro": "gpt-5-6-pro",
   "gpt-5.6-pro": "gpt-5-6-pro",
   "gpt 5.6 pro": "gpt-5-6-pro",
-  "pro": "gpt-5-6-pro",
+  "6-pro": "gpt-6-pro",
+  "gpt 6 pro": "gpt-6-pro",
+  "pro": DEFAULT_MODEL,
+  "astra": "gpt-6-astra-wm",
+  "gpt-6-astra": "gpt-6-astra-wm",
+  "gpt 6 astra": "gpt-6-astra-wm",
+  "6-sol": "gpt-6-sol-wm",
+  "gpt-6-sol": "gpt-6-sol-wm",
+  "gpt 6 sol": "gpt-6-sol-wm",
+  "6-luna": "gpt-6-luna-wm",
+  "gpt-6-luna": "gpt-6-luna-wm",
+  "gpt 6 luna": "gpt-6-luna-wm",
+  "6.1-sol": "gpt-6.1-sol-wm",
+  "gpt-6.1-sol": "gpt-6.1-sol-wm",
+  "gpt 6.1 sol": "gpt-6.1-sol-wm",
+  "6.1-terra": "gpt-6.1-terra-wm",
+  "gpt-6.1-terra": "gpt-6.1-terra-wm",
+  "gpt 6.1 terra": "gpt-6.1-terra-wm",
+  "6-thinking": "gpt-6-thinking",
+  "gpt 6 thinking": "gpt-6-thinking",
   "5.6-thinking": "gpt-5-6-thinking",
   "gpt-5.6-thinking": "gpt-5-6-thinking",
   "gpt 5.6 thinking": "gpt-5-6-thinking",
@@ -65,15 +101,77 @@ const MODEL_ID_ALIASES: Record<string, string> = {
   "image generation": "image",
   "image-generation": "image",
   "image_generation": "image",
+  "image 2.6": "image",
+  "image-2.6": "image",
+  "image_2.6": "image",
+  "gpt-image-2.6": "image",
+  "gpt image 2.6": "image",
+  ...Object.fromEntries(Object.keys(IMAGE_VARIANT_BY_ALIAS).map((alias) => [alias, "image"])),
 };
 
 const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
+  {
+    id: "gpt-6-pro",
+    label: "GPT-6 Pro",
+    source: "static-unverified",
+    reasoningLevels: ["standard"],
+    default: true,
+    reasoningType: "pro",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6-astra-wm",
+    label: "GPT-6 Astra",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6.1-sol-wm",
+    label: "GPT-6.1 Sol",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6.1-terra-wm",
+    label: "GPT-6.1 Terra",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6-sol-wm",
+    label: "GPT-6 Sol",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6-luna-wm",
+    label: "GPT-6 Luna",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
+  {
+    id: "gpt-6-thinking",
+    label: "GPT-6",
+    source: "static-unverified",
+    reasoningLevels: [...REASONING_LEVELS],
+    reasoningType: "reasoning",
+    configurableThinkingEffort: true,
+  },
   {
     id: "gpt-5-6-pro",
     label: "GPT-5.6 Pro",
     source: "static-unverified",
     reasoningLevels: ["standard"],
-    default: true,
     reasoningType: "pro",
   },
   {
@@ -116,7 +214,7 @@ const STATIC_MODEL_CAPABILITIES: ModelCapability[] = [
     id: "image",
     label: "Image Generation",
     source: "static-unverified",
-    reasoningLevels: ["standard", "extended"],
+    reasoningLevels: ["standard"],
     reasoningType: "pro",
     configurableThinkingEffort: true,
     enabledTools: ["image_gen_tool_enabled"],
@@ -130,6 +228,11 @@ export const NO_REASONING = "none";
 export function canonicalModelId(model: string): string {
   const trimmed = model.trim();
   return MODEL_ID_ALIASES[trimmed.toLowerCase()] ?? trimmed;
+}
+
+export function imageVariantForModel(model: string | undefined): ImageVariant | undefined {
+  if (!model) return undefined;
+  return IMAGE_VARIANT_BY_ALIAS[model.trim().toLowerCase()];
 }
 
 export function modelUsesThinkingEffort(model: string): boolean {
@@ -169,6 +272,7 @@ export async function listModels(options: { sessionTokenPath: string }): Promise
         referer: "https://chatgpt.com/",
         "user-agent": "pro-cli/0.1",
       },
+      signal: AbortSignal.timeout(10_000),
     });
 
     if (!response.ok) {
@@ -226,8 +330,11 @@ function parseLiveModels(payload: LiveModelPayload): ModelCapability[] {
   const models = Array.isArray(payload.models) ? (payload.models as LiveModel[]) : [];
   return models
     .map((model) => {
+      if (!model || typeof model !== "object") return null;
       if (typeof model.slug !== "string" || typeof model.title !== "string") return null;
-      const reasoningLevels = parseReasoningLevels(model.thinking_efforts, model.reasoning_type);
+      const reasoningLevels = parseReasoningLevels(
+        model.thinking_efforts, model.reasoning_type, model.configurable_thinking_effort,
+      );
       const enabledTools = parseEnabledTools(model.enabled_tools);
       const capability: ModelCapability = {
         id: model.slug,
@@ -257,8 +364,8 @@ function applyModelCapabilityOverride(model: ModelCapability): ModelCapability {
   };
 }
 
-function parseReasoningLevels(value: unknown, reasoningType: unknown): string[] {
-  if (reasoningType === "none") return [];
+function parseReasoningLevels(value: unknown, reasoningType: unknown, configurable: unknown): string[] {
+  if (reasoningType === "none" || configurable === false) return [];
   if (!Array.isArray(value)) {
     if (reasoningType === "pro") return ["standard", "extended"];
     return [...REASONING_LEVELS];
@@ -269,7 +376,7 @@ function parseReasoningLevels(value: unknown, reasoningType: unknown): string[] 
     const effort = (item as { thinking_effort?: unknown }).thinking_effort;
     return typeof effort === "string" ? [effort] : [];
   });
-  return levels.length > 0 ? levels : [...REASONING_LEVELS];
+  return levels;
 }
 
 function parseEnabledTools(value: unknown): string[] {

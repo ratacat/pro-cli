@@ -226,7 +226,7 @@ describe("robot-mode CLI", () => {
       const created = JSON.parse(createdResult.stdout);
       const jobId = created.data.job.id;
       expect(created.data.job.status).toBe("queued");
-      expect(created.data.job.model).toBe("gpt-5-6-pro");
+      expect(created.data.job.model).toBe("gpt-6-pro");
       expect(created.data.job.reasoning).toBe("standard");
       expect(created.data.daemon.started).toBe(false);
       expect(created.data.job.prompt).toBe("");
@@ -378,6 +378,74 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test.each([
+    ["GPT 6 Pro", "gpt-6-pro"],
+    ["6-pro", "gpt-6-pro"],
+    ["pro", "gpt-6-pro"],
+    ["astra", "gpt-6-astra-wm"],
+    ["gpt-6-astra", "gpt-6-astra-wm"],
+    ["6.1-sol", "gpt-6.1-sol-wm"],
+    ["6.1-terra", "gpt-6.1-terra-wm"],
+  ])("routes model alias %s to %s with standard effort", async (alias, model) => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => { expression = script; });
+      const result = await run(["ask", "hello", "--model", alias, "--json"], { home });
+      expect(result.code).toBe(0);
+      expect(requestBodyFromExpression(expression)).toMatchObject({
+        model, thinking_effort: "standard", history_and_training_disabled: true,
+      });
+    });
+  });
+
+  test.each(["gpt-6-pro", "image"])("rejects unsupported %s effort before submitting a conversation", async (model) => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let submitted = false;
+      installFakeCdp(conversationStream("OK"), () => { submitted = true; });
+      const result = await run(["ask", "hello", "--model", model, "--reasoning", "extended", "--json"], { home });
+      expect(result.code).toBe(EXIT.invalidArgs);
+      expect(submitted).toBe(false);
+    });
+  });
+
+  test.each(["none", "auto", "reasoning", "pro"])("omits effort for a live %s model without configurable thinking", async (reasoningType) => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      let expression = "";
+      installFakeCdp(conversationStream("OK"), (script) => { expression = script; });
+      const cdpFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+        if (String(url) === "https://chatgpt.com/backend-api/models") {
+          return Response.json({ models: [{ slug: "new-instant", title: "New Model", reasoning_type: reasoningType, configurable_thinking_effort: false, thinking_efforts: [] }] });
+        }
+        return cdpFetch(url, init);
+      }) as typeof fetch;
+      const result = await run(["ask", "hello", "--model", "new-instant", "--json"], { home });
+      expect(result.code).toBe(0);
+      expect(requestBodyFromExpression(expression).thinking_effort).toBeUndefined();
+      expect(JSON.parse(result.stdout).data.job.reasoning).toBe("none");
+      const invalid = await run(["job", "create", "hello", "--model", "new-instant", "--reasoning", "standard", "--no-start", "--json"], { home });
+      expect(invalid.code).toBe(EXIT.invalidArgs);
+    });
+  });
+
+  test("live catalog changes override static thinking levels for durable jobs", async () => {
+    await withHome(async (home) => {
+      await writeSessionToken(home);
+      globalThis.fetch = (async () => Response.json({ models: [{
+        slug: "gpt-6-pro", title: "GPT-6 Pro", reasoning_type: "pro",
+        thinking_efforts: [{ thinking_effort: "extended" }],
+      }] })) as unknown as typeof fetch;
+      const result = await run(["job", "create", "hello", "--no-start", "--json"], { home });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).data.job.reasoning).toBe("extended");
+      const invalid = await run(["job", "create", "hello", "--reasoning", "standard", "--no-start", "--json"], { home });
+      expect(invalid.code).toBe(EXIT.invalidArgs);
+    });
+  });
+
   test("rejects explicit reasoning levels the model catalog does not list", async () => {
     await withHome(async (home) => {
       await writeSessionToken(home);
@@ -412,7 +480,7 @@ describe("robot-mode CLI", () => {
 
       expect(result.code).toBe(0);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("gpt-5-6-pro");
+      expect(requestBody.model).toBe("gpt-6-pro");
       expect(requestBody.thinking_effort).toBe("standard");
     });
   });
@@ -468,7 +536,7 @@ describe("robot-mode CLI", () => {
 
       expect(result.code).toBe(0);
       const requestBody = requestBodyFromExpression(expression);
-      expect(requestBody.model).toBe("gpt-5-6-pro");
+      expect(requestBody.model).toBe("gpt-6-pro");
       expect(requestBody.thinking_effort).toBe("standard");
     });
   });
@@ -589,6 +657,27 @@ describe("robot-mode CLI", () => {
       const payload = JSON.parse(result.stdout);
       expect(payload.data.job.model).toBe("image");
       expect(payload.data.job.reasoning).toBe("standard");
+      expect(payload.data.job.options.temporary).toBe(false);
+      expect(payload.data.job.options.timeoutMs).toBe(600_000);
+    });
+  });
+
+  test.each([
+    ["Sunburst 2.6", "sunburst"],
+    ["gpt-image-2.6-sunburst", "sunburst"],
+    ["Flare 2.6", "flare"],
+    ["gpt-image-2.6-flare", "flare"],
+  ])("routes %s image variant alias to image with variant metadata", async (alias, variant) => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["job", "create", "a poster", "--no-start", "--model", alias, "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.data.job.model).toBe("image");
+      expect(payload.data.job.options.imageVariant).toBe(variant);
       expect(payload.data.job.options.temporary).toBe(false);
       expect(payload.data.job.options.timeoutMs).toBe(600_000);
     });

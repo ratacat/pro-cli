@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "bun:test";
-import { listModels } from "../src/models";
+import { canonicalModelId, imageVariantForModel, listModels } from "../src/models";
 
 const originalFetch = globalThis.fetch;
 
@@ -37,13 +37,13 @@ describe("model discovery", () => {
 
     expect(result.source).toBe("static");
     expect(result.warning).toContain("No captured ChatGPT session token");
-    expect(result.defaultModel).toBe("gpt-5-6-pro");
+    expect(result.defaultModel).toBe("gpt-6-pro");
     expect(result.models.map((model) => model.id)).not.toContain("auto");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-6-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-5-5-pro");
     expect(result.models.map((model) => model.id)).toContain("gpt-4-5");
-    expect(result.models.find((model) => model.id === "gpt-5-6-pro")).toMatchObject({
-      label: "GPT-5.6 Pro",
+    expect(result.models.find((model) => model.id === "gpt-6-pro")).toMatchObject({
+      label: "GPT-6 Pro",
       reasoningLevels: ["standard"],
       reasoningType: "pro",
       default: true,
@@ -56,11 +56,21 @@ describe("model discovery", () => {
     });
     expect(result.models.find((model) => model.id === "image")).toMatchObject({
       label: "Image Generation",
-      reasoningLevels: ["standard", "extended"],
+      reasoningLevels: ["standard"],
       reasoningType: "pro",
       configurableThinkingEffort: true,
       enabledTools: ["image_gen_tool_enabled"],
     });
+    expect(canonicalModelId("sunburst")).toBe("image");
+    expect(canonicalModelId("Sunburst 2.6")).toBe("image");
+    expect(canonicalModelId("gpt-image-2.6-sunburst")).toBe("image");
+    expect(canonicalModelId("flare 2.6")).toBe("image");
+    expect(canonicalModelId("gpt-image-2.6-flare")).toBe("image");
+    expect(canonicalModelId("6.1-sol")).toBe("gpt-6.1-sol-wm");
+    expect(canonicalModelId("6.1-terra")).toBe("gpt-6.1-terra-wm");
+    expect(imageVariantForModel("Sunburst 2.6")).toBe("sunburst");
+    expect(imageVariantForModel("gpt-image-2.6-flare")).toBe("flare");
+    expect(imageVariantForModel("image")).toBeUndefined();
   });
 
   test("loads live ChatGPT model catalog with bearer auth", async () => {
@@ -96,7 +106,7 @@ describe("model discovery", () => {
       expect(authHeader).toStartWith("Bearer ");
       expect(accountHeader).toBe("acct_test");
       expect(result.source).toBe("live");
-      expect(result.defaultModel).toBe("gpt-5-6-pro");
+      expect(result.defaultModel).toBe("gpt-6-pro");
       expect(result.chatgptDefaultModel).toBe("gpt-5-5");
       expect(result.modelPickerVersion).toBe(2);
       expect(result.models[0]).toMatchObject({
@@ -136,6 +146,8 @@ describe("model discovery", () => {
           default_model_slug: "auto",
           models: [
             { slug: "auto", title: "Auto" },
+            null,
+            "malformed",
             { slug: 123, title: "Bad slug" },
             { slug: "gpt-5-5-pro", title: "GPT-5.5 Pro", reasoning_type: "pro" },
           ],
